@@ -13,10 +13,6 @@
 #include <iostream>
 #include <fstream>
 #include <sys/prctl.h>
-#include <sys/stat.h>
-
-// 日志目录。固定一处，PC 侧 `adb pull` 直接取整个目录，不用每次找路径。
-#define LOG_DIR "/data/local/tmp/idv_log"
 
 #include<iostream>
 #include<ctime>
@@ -85,22 +81,10 @@ void daemonize() {
     // stdin → /dev/null
     open("/dev/null", O_RDONLY);
 
-    // stdout/stderr → 固定日志目录。守护进程以 root 跑，/data/local/tmp 可写。
-    // 0666 之外还要显式 chmod：open 的 mode 会被 umask 削掉，不补这一下
-    // adb shell(shell 用户) 会 pull 不走，表现是"文件明明在却读不到"。
-    // 用 O_TRUNC 不用 O_APPEND：每次启动都是干净的一份，排查时不必在几百 KB
-    // 历史里找最后一次运行从哪开始。
-    mkdir(LOG_DIR, 0777);
-    chmod(LOG_DIR, 0777);
-    open(LOG_DIR "/overlay.log", O_WRONLY | O_CREAT | O_TRUNC, 0666);   // fd 1
-    open(LOG_DIR "/overlay.err", O_WRONLY | O_CREAT | O_TRUNC, 0666);   // fd 2
-    chmod(LOG_DIR "/overlay.log", 0666);
-    chmod(LOG_DIR "/overlay.err", 0666);
-
-    // 重定向到文件后 stdio 变成全缓冲，printf 要攒满 4KB 才落盘。
-    // 进程被杀或中途 pull 都会丢掉最后那几行 —— 恰好就是出问题时最想看的几行。
-    setvbuf(stdout, NULL, _IONBF, 0);
-    setvbuf(stderr, NULL, _IONBF, 0);
+    // stdout → 日志文件（追加写入）
+    open("/data/local/tmp/hack_stdout.log", O_WRONLY | O_CREAT | O_APPEND, 0666);
+    // stderr → 同一个日志文件（追加写入）
+    open("/data/local/tmp/hack_stderr.log", O_WRONLY | O_CREAT | O_APPEND, 0666);
 }
 
 
@@ -108,16 +92,6 @@ int main(int argc, char *argv[]) {
 
     daemonize();
     touch_build_entropy();
-
-    // 日志头。构建标记用来确认设备上跑的确实是刚编出来的那一版 ——
-    // 产物名每次随机，光看时间戳容易把旧进程的日志当成新的。
-    {
-        time_t 现在 = time(nullptr);
-        char 时间串[64];
-        strftime(时间串, sizeof(时间串), "%Y-%m-%d %H:%M:%S", localtime(&现在));
-        printf("==== 叠加层启动 %s  构建标记=%s  pid=%d ====\n",
-               时间串, g_build_tag, getpid());
-    }
     // 发布版本: 注入功能已停用
     // SoHook::StartListeners();
 
