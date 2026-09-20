@@ -558,22 +558,11 @@ void read_thread(long int PD1,long int PD2,long int PD3)
         	for (int ii=0;ii<512;ii+=1){
 
         	    if (MatrixOffset == 0 && *(long long*)(&buff[ii]) == 0x656A624F72655028LL){
-        	        uint64_t 签名地址 = result.addr + i*4096 + ii*8;
-        	        // 2026-09-17 热更后 +0x430 恒为0。该处是一组步长0x88的指针，三个元素都能走到
-        	        // 同一个矩阵对象，这次更新只是让它整体位移了0x10。写死任何一个下次还会废，
-        	        // 改成在窗口内找"整条链都走得通"的槽位(p1有效 且 p1+0xa58 也有效)，自愈。
-        	        // 注意上界：只判 >0x5000000000 会让浮点垃圾(如0x400674954293DF)也蒙混过关，
-        	        // 本机用户态指针都在 0x77xx/0x79xx 段，统一卡 <0x8000000000。
-        	        for (int off = 0x300; off <= 0x500; off += 8){
-        	            uint64_t 候选 = 签名地址 + off;
-        	            uint64_t p1 = getPtr64(候选);            // getPtr64 已做 0xB4 掩码
-        	            if (p1 <= 0x5000000000 || p1 >= 0x8000000000) continue;
-        	            uint64_t p2 = getPtr64(p1 + 0xa58);
-        	            if (p2 <= 0x5000000000 || p2 >= 0x8000000000) continue;
-        	            MatrixOffset = 候选 - libbase;
-        	            printf("[矩阵命中] 签名=0x%llX 槽位=+0x%X 根=0x%llX MatrixOffset=0x%lx\n",
-        	                   (unsigned long long)签名地址, off, (unsigned long long)候选, MatrixOffset);
-        	            break;
+        	        uint64_t 矩阵根 = result.addr + i*4096 + ii*8 + 0x430;
+        	        uint64_t p1 = getPtr64(矩阵根);
+        	        if (p1 > 0x5000000000){
+        	            MatrixOffset = 矩阵根 - libbase;
+        	            printf("[矩阵命中] 偏移=0x%llX   %lx   %lx\n", (unsigned long long)矩阵根 ,libbase,MatrixOffset);
         	        }
         	    }
 
@@ -737,65 +726,15 @@ void read_thread(long int PD1,long int PD2,long int PD3)
 
 
 
-// 相机坐标偏移自愈。旧版写死 Matrix-0x290，2026-09-17 热更后该处恒为 (0,0,0)。
-// VP矩阵本身能反解出相机世界坐标(实测与真实字段差约6单位/0.5游戏米)，精度不足以直接用，
-// 但足够当"校验器"：在窗口内扫，谁最接近反解值谁就是真正的相机字段。
-// 这样以后引擎再挪这个字段，不用人工重新找。
-static int g_相机偏移 = 0;
-static int g_相机尝试 = 0;
-static int 取相机偏移(uint64_t Matrix)
-{
-    if (g_相机偏移 != 0) return g_相机偏移;
-    if (++g_相机尝试 > 60) { g_相机偏移 = -0x290; return g_相机偏移; }   // 找不到就退回旧值，不卡绘制
-
-    float m[16];
-    for (int i = 0; i < 16; i++) m[i] = getFloat(Matrix + i*4);
-    // 行向量约定 clip = world * M：左上3x3记为A，第3行为平移t，相机世界坐标 = -t * A^-1
-    float a=m[0], b=m[1], c=m[2];
-    float d=m[4], e=m[5], f=m[6];
-    float g=m[8], h=m[9], k=m[10];
-    float det = a*(e*k-f*h) - b*(d*k-f*g) + c*(d*h-e*g);
-    if (!(det > 1e-6f || det < -1e-6f)) return -0x290;
-    float ai0=(e*k-f*h)/det, ai1=(c*h-b*k)/det, ai2=(b*f-c*e)/det;
-    float ai3=(f*g-d*k)/det, ai4=(a*k-c*g)/det, ai5=(c*d-a*f)/det;
-    float ai6=(d*h-e*g)/det, ai7=(b*g-a*h)/det, ai8=(a*e-b*d)/det;
-    float t0=m[12], t1=m[13], t2=m[14];
-    float cx = -(t0*ai0 + t1*ai3 + t2*ai6);
-    float cy = -(t0*ai1 + t1*ai4 + t2*ai7);
-    float cz = -(t0*ai2 + t1*ai5 + t2*ai8);
-    if (!(cx > -1e5f && cx < 1e5f)) return -0x290;   // 同时挡住 NaN/Inf
-
-    int best = 0; float bestErr = 1e9f;
-    for (int off = -0x400; off <= -0x40; off += 4){
-        float x = getFloat(Matrix + off);
-        float y = getFloat(Matrix + off + 4);
-        float z = getFloat(Matrix + off + 8);
-        if (!(x > -1e5f && x < 1e5f)) continue;
-        if (!(y > -1e5f && y < 1e5f)) continue;
-        if (!(z > -1e5f && z < 1e5f)) continue;
-        float err = fabsf(x-cx) + fabsf(y-cy) + fabsf(z-cz);
-        if (err < bestErr){ bestErr = err; best = off; }
-    }
-    if (best != 0 && bestErr < 60.0f){
-        g_相机偏移 = best;
-        printf("[相机命中] 偏移=%d(-0x%X) 反解=(%.1f,%.1f,%.1f) 实读=(%.1f,%.1f,%.1f) 误差=%.2f\n",
-               best, -best, cx, cy, cz,
-               getFloat(Matrix+best), getFloat(Matrix+best+4), getFloat(Matrix+best+8), bestErr);
-        return best;
-    }
-    return -0x290;
-}
-
 void Draw_Main(ImDrawList *Draw){
     if (libbase == 0 || 状态 == 0) return;  // 数据未就绪，跳过本帧绘制
     int 内核人物数量 = 0;
     const bool 模仿者绘制中 = false; // 发布版本: 注入功能已停用, SoHook::IsCopycatDrawingActive() 不再调用
     
     Matrix = getPtr64(getPtr64(libbase + MatrixOffset) + 0xa58) + 0x2c0; //矩阵
-    int 相机偏移 = 取相机偏移(Matrix);
-    M.X = getFloat(Matrix + 相机偏移);
-    M.Z = getFloat(Matrix + 相机偏移 + 4);
-    M.Y = getFloat(Matrix + 相机偏移 + 8);
+    M.X = getFloat(Matrix - 0x290);
+    M.Z = getFloat(Matrix - 0x290+4);
+    M.Y = getFloat(Matrix - 0x290+8);
     
     // 红夫人坐标读取（加保护检查，防止地址为0时崩溃）
     if (红夫人 != 0) {
@@ -949,12 +888,7 @@ void Draw_Main(ImDrawList *Draw){
     		    }
 
     	    else if (strstr(data[i].类名, "sender") != NULL){
-    	        // 场景里加载的 sender 对象远多于本局实际存在的密码机(实测军工厂: 17个对象 vs 7台真机)。
-    	        // 多出来的是候选刷新点/未激活的池子对象，它们的 +0x1a0 是 0/NaN/浮点垃圾，
-    	        // 而真实存在的密码机 +0x1a0 恒为 500.0f(与"450=玩家角色"同一套类型标记)。
-    	        // 实测这一条判据正好筛出 7 台，不多不少。
-    	        // 注意: 若发现密码机被破译完成后从叠加层消失，就是这一行需要放宽。
-    	        if (show_draw_secret_mechine && getFloat(data[i].obj + 0x1a0) == 500.0f){
+    	        if (show_draw_secret_mechine){
     	            std::string s;
     	            std::ostringstream oss;
     	            oss << std::fixed << std::setprecision(1) << 距离;
@@ -1184,7 +1118,6 @@ void Layout_tick_UI(bool *main_thread_flag) {
             ImGui::Text("矩阵地址:%lx", Matrix);
             ImGui::Text("数组地址:%lx", Arrayaddr);
             ImGui::Text("矩阵偏移:%lx", MatrixOffset);
-            ImGui::Text("相机偏移:%d", g_相机偏移);
             ImGui::Text("模块页数:%d", c);
             ImGui::Text("数组偏移:%lx", ArrayaddrOffset);
             ImGui::Text("数据获取状态:%d", 数据获取状态);
