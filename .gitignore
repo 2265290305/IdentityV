@@ -12,6 +12,11 @@ build_last.bat
 *.so
 *.a
 
+# 本地分析配置：含目标相关常量与本机路径，不进仓库
+tools/re/config.py
+__pycache__/
+*.pyc
+
 # 系统文件
 .DS_Store
 Thumbs.db
