@@ -12,15 +12,9 @@ build_last.bat
 *.so
 *.a
 
-# 本地分析配置：含目标相关常量与本机路径，不进仓库
-tools/re/config.py
-# Local reverse-engineering notes and target-specific field inventories.
-tools/re/local-payload-audit/
 __pycache__/
 *.pyc
 
 # 系统文件
 .DS_Store
 Thumbs.db
-# 注入调研目录：含目标偏移与本机路径，不进仓库
-injection-research/
