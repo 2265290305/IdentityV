@@ -7,6 +7,9 @@
 #include "DrawTool.h"
 #include "Name.h"
 #include "SoHookIntegration.h"
+#include "PyProgress.h"
+#include "PyGenius.h"
+#include "PySelf.h"
 #include <linux/input.h>
 #include <sstream>
 #include <iomanip>
@@ -139,7 +142,8 @@ void calculate_line_reflection(float x1, float y1, float x2, float y2, float xs,
 uintptr_t libbase;
 uintptr_t Arrayaddr, Count, Matrix;
 uintptr_t 对象,对象阵营,自身,自身阵营,namezfcz,namezfc;
-uintptr_t 红夫人,红夫人镜像,镜子,捏镜子;
+uintptr_t 红夫人,红夫人镜像,镜子,捏镜子,镜子预览;
+float 镜线X1, 镜线Y1, 镜线X2, 镜线Y2;   // 本帧镜面在水平面上的直线(两点)，mirror==true 时有效
 int 数量,zfcz,zfc;
 float 过滤矩阵[17];
 float matrix[16];
@@ -148,17 +152,17 @@ float angle;
 static bool show_draw_Rect = true;//方框
 static bool show_draw_Line = true;//射线
 static bool show_draw_Camera = false;//相机
-static bool show_draw_Door = false;//门
+static bool show_draw_Door = true;//门(开门进度，走 Python 层单独绘制，不依赖 getscene)
 static bool show_draw_Box = false;//盒子
 static bool show_draw_Name = true;//名字
 static bool show_draw_Distance = true;//距离
 static bool show_draw_Cellar = true;//地窖
 static bool show_draw_Chair = false;//椅子
-static bool show_draw_Prop = true;//道具
+static bool show_draw_Prop = false;//道具
+static bool show_draw_Genius = true;//天赋/辅助特质(走 CPython 链路，见 PyGenius.h)
 static bool show_draw_prophet = true;//预知监管者
 static bool redqueenmod = false;//红夫人模式
-static bool show_draw_sender = true;//密码机进度
-static bool show_draw_secret_mechine = false;//密码机位置
+static bool show_draw_secret_mechine = true;//密码机(含破译进度/进度条/最后一台)
 static bool show_draw_Role = false;//角色
 static bool show_draw_touch = false;//孽蜥
 static bool show_draw_ClassName = false;//类名
@@ -476,19 +480,21 @@ bool ShouldSkipEntity(const DataStruct& obj) {
     if (strstr(obj.类名, "girl_e_sj_zuoyi") != NULL) return true;
     if (strstr(obj.类名, "h55_survivor_w_shangren_tiaoban") != NULL) return true; // 商人跳板
 
+    // 废弃模型(形态切换后留在数组里的旧形态)。这条取代了原来那份
+    // "红蝶/无常/歌剧/破轮/木偶/冒险家" 的类名黑名单 —— 那份是按角色名猜的,
+    // 漏一个角色就漏一个, 而且只在 inform_ghost 打开时才生效。
+    // 现在直接问引擎: unit.another_model + 0x20 就是废弃形态的场景对象指针,
+    // 精确、跟视角无关、不用维护名单。详见 PySelf.h 文件头。
+    if (本机::是废弃模型(obj.obj)) return true;
+
     int checkVal = getDword(obj.obj + 0x70);
     float checkFloat = getFloat(obj.obj + 0x1a0);
     bool is_ghost_obj = (checkVal != 0x1000000 || checkFloat != 450.0f);
 
-    if (is_ghost_obj) {
-        if (!inform_ghost) return true; // 不显示幽灵/隐身角色, 直接过滤
-        // 即便开启显示幽灵, 这几个特殊角色的隐身态数据不可靠(坐标/朝向失真), 依然过滤
-        if (strstr(obj.str, "红蝶") || strstr(obj.str, "无常") ||
-            strstr(obj.str, "歌剧") || strstr(obj.str, "破轮") ||
-            strstr(obj.str, "木偶") || strstr(obj.str, "冒险家")) {
-            return true;
-        }
-    }
+    // 注意 +0x70 就是 NeoX 模型对象的 visible, 是**渲染剔除的结果**:
+    // 废弃模型恒不可见, 但远处的真实对象同样不可见。所以它只能当"要不要按幽灵显示"的开关,
+    // 绝不能当存在性/真假判据 —— 那会重演"求生者只看得到身边的密码机"。
+    if (is_ghost_obj && !inform_ghost) return true;
     return false;
 }
 
@@ -596,7 +602,14 @@ void read_thread(long int PD1,long int PD2,long int PD3)
         sleep(5);
     }
     状态 = 2;
-	
+
+    // 密码机破译进度：走 CPython 对象图，自带后台线程(400ms 一轮)，跟这里的 3 秒大循环解耦
+    密码机进度::启动(libbase);
+    // 天赋与辅助特质：同一条 CPython 链路，独立线程 500ms 一轮(一局内基本不变，不用刷那么勤)
+    天赋::启动(libbase);
+    // 自身锚点(g_cam_ctrl.unit)与废弃模型黑名单：100ms 一轮，切换操控对象时要立刻跟上
+    本机::启动(libbase);
+
     Arrayaddr = getPtr64(libbase + ArrayaddrOffset);
     uint64_t ArrayEnd = getPtr64(libbase + ArrayaddrOffset + 8);
     Count = (ArrayEnd - Arrayaddr) / 8;
@@ -621,6 +634,7 @@ void read_thread(long int PD1,long int PD2,long int PD3)
         红夫人 = 0;      // 每轮清零，防止跨局/跨帧残留
         红夫人镜像 = 0;
         镜子 = 0;
+        镜子预览 = 0;
         for (int ii = 0; ii < Count && 指针数量 < 1000; ii++){
             对象 = getPtr64(curArray+0x8 * ii);	// 遍历数量次数            
                 
@@ -663,6 +677,14 @@ void read_thread(long int PD1,long int PD2,long int PD3)
 			if (strstr(过滤类名.c_str(), "player") != NULL||strstr(过滤类名.c_str(), "boss") != NULL || pd1 == 450 || strstr(过滤类名.c_str(), "scene") != NULL || strstr(过滤类名.c_str(), "prop") != NULL || strstr(过滤类名.c_str(), "mirror") != NULL || Debugging )
 			{
     			data[指针数量].obj = 对象;
+    			// 阵营/str 必须先清零：下面那串 if-else 只有五个分支，而入口条件里的
+    			// `pd1 == 450` 和 `Debugging` 能让对象进来却一个分支都不命中。
+    			// data[] 是全局数组、原地复用，不清就会**沿用上一帧同下标那个对象的
+    			// 阵营和名字** —— 表现是装饰物被当成角色画出来、还顶着别人的名字，
+    			// 并且 内核人物数量 虚高。正常游玩时类名基本都能命中 player/boss，
+    			// 所以这个洞主要在开「绘制调试」时发作。
+    			data[指针数量].阵营 = 0;
+    			data[指针数量].str[0] = '\0';
     			if (strstr(过滤类名.c_str(), "boss") != NULL){
     			//data[指针数量].str=getboss(过滤类名.c_str());
     			strcpy(data[指针数量].str, getboss(过滤类名.c_str()));
@@ -687,7 +709,10 @@ void read_thread(long int PD1,long int PD2,long int PD3)
     			}
 
     			else if (strstr(过滤类名.c_str(), "redqueen") != NULL&&strstr(过滤类名.c_str(), "mirror") != NULL&&strstr(过滤类名.c_str(), "model") != NULL){
+    			// fx/model/redqueen_mirror_model_obj_001.gim：准备放镜时的预览镜子(PlaceIndicator.rtc_model)，
+    			// 常驻复用同一个对象，只在准备阶段可见。用法见 Draw_Main 里的镜线计算
     			data[指针数量].阵营=5;
+    			镜子预览 = 对象;
     			}
     			//sprintf(data[指针数量].类名, "%s", 过滤类名.c_str());
     			strcpy(data[指针数量].类名, 过滤类名.c_str());
@@ -704,17 +729,23 @@ void read_thread(long int PD1,long int PD2,long int PD3)
     			指针数量++;
 			}
     			
-			//红夫人模式（不依赖遍历顺序，直接用jxpd区分本体/镜像）
+			//红夫人模式：本体和镜中红夫人的类名都是 redqueen.gim，只能靠对象字段区分。
+			// 2026-09-22 热更后旧判据失效：镜中红夫人的 +0x70 不再是 65150(鬼魂)，也在地面上，
+			// 于是被当成本体，镜面算错，求生者镜像跟着红夫人跑。
+			// 现在用 +0x6D 实体种类位(实测，镜子放出状态)：
+			//   本体       0x50 = 0x40(角色实体) | 0x10
+			//   镜中红夫人 0x90 = 0x80(不占玩家槽位的角色) | 0x10
+			// 整字节会跳变(见过 0x50->0xD0)，但 0x40 位稳定，所以只看位不看整字节。
+			// 镜面 = 本体与镜中红夫人连线的垂直平分线，已用 Python 侧 MaryMirrorUnit.position/direction 验证。
+			// 镜子没放出时镜中红夫人停在 y≈-1000，下面坐标读取处的 Z>=-300 会让 mirror=false。
 			if (pd1==450){
-			    int jxpd = getDword(对象 + 0x70);
 			    uintptr_t coorPtr = getPtr64(对象 + 0x28);
 			    if (strstr(过滤类名.c_str(), "boss") != NULL && strstr(过滤类名.c_str(), "redqueen") != NULL && strstr(过滤类名.c_str(), "mirror") == NULL
 			        && getFloat(coorPtr + 0xa0) != 0 && getFloat(coorPtr + 0xa8) != 0) {
-			        if (jxpd != 65150 && getFloat(coorPtr + 0xa4) >= -300) {
-			            红夫人 = 对象;      // 本体：非鬼魂且在地面
-			        } else {
-			            红夫人镜像 = 对象;  // 镜像：鬼魂状态或在地下
-			        }
+			        uint8_t 种类 = 0;
+			        vm_readv(对象 + 0x6D, &种类, 1);
+			        if (种类 & 0x40)      红夫人 = 对象;       // 本体
+			        else if (种类 & 0x80) 红夫人镜像 = 对象;   // 镜中红夫人
 			    }
     			if (strstr(过滤类名.c_str(), "boss") != NULL && strstr(过滤类名.c_str(), "mirror") != NULL
     			    && getFloat(coorPtr + 0xa0) != 0 && getFloat(coorPtr + 0xa8) != 0)
@@ -773,6 +804,14 @@ static inline bool 实体本局存在(uintptr_t obj)
 {
     return getDword(obj + 0x240) == 2;
 }
+// 破译进度配色：<20 绿、20~60 黄、>60 红
+static inline ImColor 进度颜色(float v)
+{
+    if (v < 20.0f)  return 绿色;
+    if (v <= 60.0f) return 黄色;
+    return 红色;
+}
+
 static inline bool 是真实密码机(uintptr_t obj)
 {
     // 活跃位 + 一个密码机专用的辅助值。单用任何一个都不够：
@@ -834,20 +873,41 @@ void Draw_Main(ImDrawList *Draw){
     if (libbase == 0 || 状态 == 0) return;  // 数据未就绪，跳过本帧绘制
     int 内核人物数量 = 0;
     const bool 模仿者绘制中 = false; // 发布版本: 注入功能已停用, SoHook::IsCopycatDrawingActive() 不再调用
-    
+
+    // ---- 自身锚点：引擎自己持有的答案。相机深度启发式兜底已停用，这是唯一来源 ----
+    // g_cam_ctrl.unit 就是"当前视角/操控的单位"，切到机械玩偶/梦之信徒时会跟着换，
+    // 所以这里每帧重取：一旦换了操控对象，自身锚点立刻跟上。
+    // (不能用 g_unit —— 那是"我的主角色"，切从属时纹丝不动，会高亮错人。见 PySelf.h)
+    uint64_t 权威自身 = 0;
+    const bool 有权威自身 = 本机::锚点(权威自身);
+    if (有权威自身) {
+        自身 = (uintptr_t)权威自身;
+        int c = 本机::阵营();
+        if (c == 1 || c == 2) 自身阵营 = (uintptr_t)c;
+    }
+
     Matrix = getPtr64(getPtr64(libbase + MatrixOffset) + 0xa58) + 0x2c0; //矩阵
     int 相机偏移 = 取相机偏移(Matrix);
     M.X = getFloat(Matrix + 相机偏移);
     M.Z = getFloat(Matrix + 相机偏移 + 4);
     M.Y = getFloat(Matrix + 相机偏移 + 8);
     
-    // 红夫人坐标读取（加保护检查，防止地址为0时崩溃）
+    // ---- 红夫人镜面：两个来源，先放下的镜子，其次准备阶段的预览镜子 ----
+    // (1) 镜子已放下：本体与镜中红夫人连线的垂直平分线(已用 Python 侧 MaryMirrorUnit 验证)。
+    //     镜子没放时镜中红夫人停在 y≈-1000/-2000，Z>=-300 挡掉。
+    // (2) 准备放镜(SkillMaryPlaceMirrorPrepare)：镜中红夫人还在地下，但预览镜子已经可见。
+    //     预览镜子的 objcoor 是 3x3 旋转(+0x78 起、每行 12 字节) + 位置(+0xa0)：
+    //       +0x90/+0x98 = 局部 Z 轴 = 投掷方向 = 镜面法向(与 Python rtc_model.world_transformation 第 3 行一致)
+    //     可见位 +0x73 只在准备阶段为 1。
+    mirror = false;
+    bool 本体有效 = false, 镜像有效 = false;
     if (红夫人 != 0) {
         uintptr_t 红夫人坐标指针 = getPtr64(红夫人 + 0x28);
         if (红夫人坐标指针 != 0) {
             红夫人X = getFloat(红夫人坐标指针 + 0xa0);
             红夫人Z = getFloat(红夫人坐标指针 + 0xa4);
             红夫人Y = getFloat(红夫人坐标指针 + 0xa8);
+            本体有效 = 红夫人Z >= -300 && 红夫人X != 0 && 红夫人Y != 0;
         }
     }
     if (红夫人镜像 != 0) {
@@ -856,12 +916,32 @@ void Draw_Main(ImDrawList *Draw){
             红夫人镜像X = getFloat(镜像坐标指针 + 0xa0);
             红夫人镜像Z = getFloat(镜像坐标指针 + 0xa4);
             红夫人镜像Y = getFloat(镜像坐标指针 + 0xa8);
+            镜像有效 = 红夫人镜像Z >= -300 && 红夫人镜像X != 0 && 红夫人镜像Y != 0;
         }
     }
-    if (红夫人Z >= -300 && 红夫人镜像Z >= -300&&红夫人X != 0 && 红夫人Y != 0 && 红夫人镜像X != 0 && 红夫人镜像Y != 0) {
-        mirror=true;
-    }else{
-        mirror=false;
+    if (本体有效 && 镜像有效) {
+        float mx = (红夫人X + 红夫人镜像X) / 2.0f, my = (红夫人Y + 红夫人镜像Y) / 2.0f;
+        float dx = 红夫人镜像X - 红夫人X,      dy = 红夫人镜像Y - 红夫人Y;   // 法向
+        if (dx * dx + dy * dy > 1e-4f) {
+            镜线X1 = mx;      镜线Y1 = my;
+            镜线X2 = mx - dy; 镜线Y2 = my + dx;                              // 沿镜面方向
+            mirror = true;
+        }
+    }
+    if (!mirror && 镜子预览 != 0) {
+        uint8_t 可见 = 0;
+        vm_readv(镜子预览 + 0x73, &可见, 1);
+        uintptr_t cp = getPtr64(镜子预览 + 0x28);
+        if (可见 == 1 && cp != 0) {
+            float px0 = getFloat(cp + 0xa0), pz0 = getFloat(cp + 0xa4), py0 = getFloat(cp + 0xa8);
+            float nx = getFloat(cp + 0x90), ny = getFloat(cp + 0x98);
+            float 模 = nx * nx + ny * ny;
+            if (px0 != 0 && py0 != 0 && pz0 >= -300 && 模 > 0.9f && 模 < 1.1f) {
+                镜线X1 = px0;      镜线Y1 = py0;
+                镜线X2 = px0 - ny; 镜线Y2 = py0 + nx;
+                mirror = true;
+            }
+        }
     }
     vm_readv(Matrix, matrix, 64);
     if (!首帧矩阵){
@@ -873,6 +953,67 @@ void Draw_Main(ImDrawList *Draw){
     if (show_draw_prophet){
         auto textSize = ImGui::CalcTextSize(监管者预知, 0, 25);
         Draw->AddText({px-(textSize.x/2),130}, 红色, 监管者预知);
+    }
+
+    // 已破译 4 台后，剩下那台在修的就是最后一台 —— 单独用进度条标出来
+    {
+        float 最后进度 = 0.f;
+        if (show_draw_secret_mechine && 密码机进度::最后一台(最后进度)){
+            char 文字[64];
+            snprintf(文字, sizeof(文字), "最后一台 %.1f%%", 最后进度);
+            auto ts = ImGui::CalcTextSize(文字, 0, 25);
+            const float 条宽 = 160.0f, 条高 = 14.0f, 间隙 = 8.0f;
+            float x0 = px - (条宽 + 间隙 + ts.x) / 2.0f;
+            float y0 = 158.0f;                                  // 预知监管那行(y=130)的下一行
+            ImColor c = 进度颜色(最后进度);
+            float 填充 = 条宽 * (最后进度 / 100.0f);
+            if (填充 > 0.0f)
+                Draw->AddRectFilled({x0, y0}, {x0 + 填充, y0 + 条高}, c);
+            Draw->AddRect({x0, y0}, {x0 + 条宽, y0 + 条高}, ImColor(255,255,255,255));
+            Draw->AddText({x0 + 条宽 + 间隙, y0 + 条高/2.0f - ts.y/2.0f}, c, 文字);
+        }
+    }
+
+    // ---- 大门开门进度 ----
+    // 大门**不走下面那个实体循环**：getscene() 只认 prop_76/sender，大门那条分支收不到东西
+    // (原版认 6 个类名，Name.h 重构时缩成 2 个，门/箱/椅三条分支就成了孤儿)。
+    // 所以这里直接拿 Python 侧的 model+0x20 场景对象自己投影。
+    // 也不能靠场景侧判据补救：实测两扇门的类名都不一样(prop_30 / wooddoor01a)，
+    // 而且 +0x240 两扇都是 0 —— "最可靠的存在性判据"在大门上失效。
+    if (show_draw_Door){
+        for (int i = 0; i < 密码机进度::大门数(); i++){
+            密码机进度::大门条目 门;
+            if (!密码机进度::取大门(i, 门)) continue;
+            if (密码机进度::已开启(门)) continue;          // 已经开了的不用再画
+            if (!门.可开) continue;                         // 还没通电(不可开)的不画
+
+            uintptr_t 坐标指针 = getPtr64((uintptr_t)门.场景对象 + 0x28);
+            if (坐标指针 == 0) continue;
+            float mx = getFloat(坐标指针 + 0xa0);
+            float mz = getFloat(坐标指针 + 0xa4);          // +0xa4 是高度
+            float my = getFloat(坐标指针 + 0xa8);
+            if (mx == 0 && my == 0) continue;
+
+            float cam = matrix[3]*mx + matrix[7]*mz + matrix[11]*my + matrix[15];
+            if (cam <= 0.01f) continue;                    // 在相机背后
+            float sx = px + (matrix[0]*mx + matrix[4]*mz + matrix[8]*my + matrix[12]) / cam * px;
+            float sy = py - (matrix[1]*mx + matrix[5]*(mz+8.5f) + matrix[9]*my + matrix[13]) / cam * py;
+
+            int 米 = (int)(sqrt(pow(mx - Z.X, 2) + pow(my - Z.Y, 2) + pow(mz - Z.Z, 2)) / 距离比例);
+            char 文字[64];
+            if (门.开启中)      snprintf(文字, sizeof(文字), "[%.1f%%↑]", 门.进度);
+            else                snprintf(文字, sizeof(文字), "[%.1f%%]",  门.进度);   // 不可开时按灰色画，见下
+
+            // 有进度就在文字上方画一条，跟密码机那套一致
+            if (门.进度 > 0.05f){
+                const float 条宽 = 120.0f, 条高 = 10.0f;
+                float bx = sx - 条宽 / 2.0f, by = sy - 条高 - 3.0f;
+                Draw->AddRectFilled({bx, by}, {bx + 条宽 * (门.进度 / 100.0f), by + 条高}, 进度颜色(门.进度));
+                Draw->AddRect({bx, by}, {bx + 条宽, by + 条高}, ImColor(255,255,255,255));
+            }
+            auto ts = ImGui::CalcTextSize(文字, 0, 25);
+            Draw->AddText({sx - ts.x/2.0f, sy}, 门.可开 ? 进度颜色(门.进度) : ImColor(180,180,180,255), 文字);
+        }
     }
 
     for (int i = 0; i < 数量; i++){
@@ -900,6 +1041,10 @@ void Draw_Main(ImDrawList *Draw){
 		    continue;//跳过地下
 		}
 		if (data[i].阵营 == 1 || data[i].阵营 == 2) 内核人物数量++;
+		// 本体是监管时，游戏自己就会显示监管者个体，这里不再重复画任何监管者。
+		// 只认 CPython 锚点给的阵营：兜底的相机深度启发式可能把求生者误判成监管，
+		// 那样会让求生者视角下的监管整个消失，代价远大于多画一个。
+		if (有权威自身 && 自身阵营 == 1 && data[i].阵营 == 1) continue;
 		int jxpd = getDword(data[i].obj + 0x70);
 		camera = matrix[3] * D.X + matrix[7] * D.Z + matrix[11] * D.Y + matrix[15];
         距离 = sqrt(pow(D.X - Z.X, 2) + pow(D.Y - Z.Y, 2) + pow(D.Z - Z.Z, 2)) / 距离比例;
@@ -1004,14 +1149,35 @@ void Draw_Main(ImDrawList *Draw){
     	    else if (strstr(data[i].类名, "sender") != NULL){
     	        // 判据见上面 是真实密码机() 的注释。若发现密码机被破译完成后从叠加层消失，改那里。
     	        if (show_draw_secret_mechine && 是真实密码机(data[i].obj)){
-    	            std::string s;
-    	            std::ostringstream oss;
-    	            oss << std::fixed << std::setprecision(1) << 距离;
-    	            s += "[密码机] " + oss.str() + " 米";
-    	            auto textSize = ImGui::CalcTextSize(s.c_str(), 0, 25);
-    	            Draw->AddText({r_x-(textSize.x/2), r_y},
-    	                (距离 >= 61 && 距离 <= 63) ? 绿色 : ImColor(255, 255, 255, 255),
-    	                s.c_str());
+    	            // 进度来自 Python 侧的 GeneratorUnit，靠 model 指针身份配对(见 PyProgress.h)。
+    	            // 配不上时(model 为空/链路失效)退化成原来的 "[密码机] X.X 米"。
+    	            float 进度 = 0.f;
+    	            bool 有进度 = 密码机进度::查询(data[i].obj, D.X, D.Y, 进度);
+    	            if (!(有进度 && 密码机进度::已破译(进度))){      // 破译完的机器本身和进度都不画
+    	                std::ostringstream oss;
+    	                oss << std::fixed << std::setprecision(1) << 距离;
+    	                std::string 距离文本 = " " + oss.str() + " 米";
+    	                char 头[24];
+    	                if (有进度) snprintf(头, sizeof(头), "[%.1f%%]", 进度);
+    	                else        snprintf(头, sizeof(头), "[密码机]");
+
+    	                // 两段分开上色：头用进度色，距离沿用原来 61~63 米变绿的规则
+    	                auto hs = ImGui::CalcTextSize(头, 0, 25);
+    	                auto ds = ImGui::CalcTextSize(距离文本.c_str(), 0, 25);
+    	                float x0 = r_x - (hs.x + ds.x) / 2.0f;
+    	                Draw->AddText({x0, r_y}, 有进度 ? 进度颜色(进度) : ImColor(255,255,255,255), 头);
+    	                Draw->AddText({x0 + hs.x, r_y},
+    	                    (距离 >= 61 && 距离 <= 63) ? 绿色 : ImColor(255, 255, 255, 255),
+    	                    距离文本.c_str());
+
+    	                // 进度条画在文字上方；进度为 0 时没有意义，不画
+    	                if (有进度 && 进度 > 0.05f){
+    	                    const float 条宽 = 120.0f, 条高 = 10.0f;
+    	                    float bx = r_x - 条宽 / 2.0f, by = r_y - 条高 - 3.0f;
+    	                    Draw->AddRectFilled({bx, by}, {bx + 条宽 * (进度 / 100.0f), by + 条高}, 进度颜色(进度));
+    	                    Draw->AddRect({bx, by}, {bx + 条宽, by + 条高}, ImColor(255,255,255,255));
+    	                }
+    	            }
     	        }
     	    }
     		}
@@ -1056,14 +1222,20 @@ void Draw_Main(ImDrawList *Draw){
                     Draw->AddText({r_x-(textSize.x/2),r_y}, ImColor(255,200,0,255), test.c_str());
                 }
                 			            
-                if (camera < 40 && camera > 10 && zy&&(data[i].阵营==1||data[i].阵营==2)){
-                    自身 = data[i].obj;
-                    Z.X = D.X;
-                    Z.Z = D.Z;
-                    Z.Y = D.Y;
-                    自身阵营=对象阵营;
-                       continue;
-                }
+                // 旧的自身判定：相机深度落在 10~40 + zy + 阵营是1或2。**已停用**(见下)。
+                // 原本只在 CPython 链路拿不到锚点时兜底，它的问题见 PySelf.h 文件头：
+                //   - 任何一个求生者走进 10~40 这条深度带都会被误判成自身
+                //   - zy 是 +0xaa，实测是通用状态位，**不区分是否自身**，挡不住
+                //   - 自身锚错 -> Z 锚错 -> 全场距离全错，而且那个人会被 continue 掉不再绘制
+                // 2026-09-22 停用：暂时只走 CPython 锚点(PySelf.h)，锚点拿不到时宁可没有自身也不猜。
+                // if (!有权威自身 && camera < 40 && camera > 10 && zy&&(data[i].阵营==1||data[i].阵营==2)){
+                //     自身 = data[i].obj;
+                //     Z.X = D.X;
+                //     Z.Z = D.Z;
+                //     Z.Y = D.Y;
+                //     自身阵营=对象阵营;
+                //        continue;
+                // }
                
                 std::string s;
 
@@ -1080,14 +1252,56 @@ void Draw_Main(ImDrawList *Draw){
         			    else if (data[i].阵营==2)
         			        ImGui::GetForegroundDrawList()->AddRect({X1, Y1},{X2, Y2}, 绿色,3, 0,1.8f);
         			}
+                    float 下一行 = Y2 + 10;            // 距离、天赋、辅助特质依次往下排
+                    const float 行高 = ImGui::GetFontSize() + 2.0f;
                     if (show_draw_Distance){
                         std::string 人物距离;
                         人物距离 += std::to_string((int) 距离);
                         人物距离 += " 米";
                         auto textSize = ImGui::CalcTextSize(人物距离.c_str(), 0, 25);
-                        Draw->AddText({X1 + W/2-(textSize.x/2),Y2+10}, ImColor(255,200,0,255), 人物距离.c_str());
+                        Draw->AddText({X1 + W/2-(textSize.x/2),下一行}, ImColor(255,200,0,255), 人物距离.c_str());
+                        下一行 += 行高;
                     }
-                    
+
+                    // 天赋简称：求生者大心脏排最后、监管挽留排最后，格式化在 PyGenius.h 里
+                    if (show_draw_Genius){
+                        天赋::信息 gi;
+                        if (天赋::查询(data[i].obj, D.X, D.Y, gi)){
+                            char 天赋行[64];
+                            天赋::天赋文本(gi, 天赋行, sizeof(天赋行));
+                            if (天赋行[0]){
+                                // 绝处逢生三态：没带=白 / 带了还没用=绿 / 带了已经用掉=灰。
+                                // 消耗标志是 unit.ability_used[102]，2026-09-22 实测**别人的也读得到**
+                                // (服务器会下发非本机玩家的消耗状态)，所以监管看四个人都准。
+                                ImColor c;
+                                switch (天赋::绝处状态(gi)) {
+                                    case 天赋::绝处_可用: c = 绿色; break;
+                                    case 天赋::绝处_已用: c = ImColor(140,140,140,255); break;
+                                    // 绝处_无(表完整且没带) 和 绝处_未知(表还没读全) 都画白色；
+                                    // 后者的文本末尾带 "?"，靠它区分
+                                    case 天赋::绝处_未知:
+                                    default:              c = ImColor(255,255,255,255); break;
+                                }
+                                auto ts = ImGui::CalcTextSize(天赋行, 0, 25);
+                                Draw->AddText({X1 + W/2-(ts.x/2),下一行}, c, 天赋行);
+                                下一行 += 行高;
+                            }
+                            // 监管再单独一行写当前辅助特质 + 剩余冷却
+                            // (带底牌会局中换特质，所以读的是实时值；冷却来自 skill_mgr，见 PyGenius.h)
+                            if (gi.阵营 == 1 && gi.辅助特质 != 0){
+                                char 特质行[48];
+                                天赋::特质行文本(gi, 天赋::特质名(gi.辅助特质), 特质行, sizeof(特质行));
+                                if (特质行[0]){
+                                    // 就绪=绿，冷却中=白；读不到冷却时按白显示(只有名字)
+                                    ImColor cc = 天赋::已就绪(gi) ? 绿色 : ImColor(255,255,255,255);
+                                    auto ts2 = ImGui::CalcTextSize(特质行, 0, 25);
+                                    Draw->AddText({X1 + W/2-(ts2.x/2),下一行}, cc, 特质行);
+                                    下一行 += 行高;
+                                }
+                            }
+                        }
+                    }
+
                     if (show_draw_Line){
                         ImGui::GetForegroundDrawList()->AddLine({px, 160},{X1 + W/2, Y1}, ImColor(255, 255, 255),2);
                     }                                          
@@ -1100,8 +1314,9 @@ void Draw_Main(ImDrawList *Draw){
 	    if (mirror&&redqueenmod){
             if (getFloat(data[i].obj+0x1a0)==450&&data[i].阵营==2){
                 std::string ss;
-                calculate_mirror_reflection(红夫人X, 红夫人Y, 红夫人镜像X, 红夫人镜像Y, D.X, D.Y, &xs_prime_mirror, &ys_prime_mirror);
-                calculate_line_reflection(红夫人X, 红夫人Y, 红夫人镜像X,  红夫人镜像Y,xs_prime_mirror, ys_prime_mirror, &D.X, &D.Y);
+                // 镜线在 Draw_Main 开头算好(放下的镜子 / 准备阶段预览镜子二选一)，这里只做一次关于直线的对称
+                float 原X = D.X, 原Y = D.Y;
+                calculate_line_reflection(镜线X1, 镜线Y1, 镜线X2, 镜线Y2, 原X, 原Y, &D.X, &D.Y);
                 camera = matrix[3] * D.X + matrix[7] * D.Z + matrix[11] * D.Y + matrix[15];
                 距离 = sqrt(pow(D.X - Z.X, 2) + pow(D.Y - Z.Y, 2) + pow(D.Z - Z.Z, 2)) / 距离比例;
         		r_x = px + (matrix[0] * D.X + matrix[4] * D.Z + matrix[8] * D.Y + matrix[12]) / camera * px;
@@ -1251,6 +1466,10 @@ void Layout_tick_UI(bool *main_thread_flag) {
             ImGui::Text("数组偏移:%lx", ArrayaddrOffset);
             ImGui::Text("数据获取状态:%d", 数据获取状态);
             ImGui::Text("监管者:%s", 监管者预知);
+            ImGui::Text("密码机进度:%s (已破译%d)", 密码机进度::状态文本(), 密码机进度::已破译数());
+            ImGui::Text("天赋:%s", 天赋::状态文本());
+            // 自身锚点：链路一旦失效这里会写明原因，绘制自动退回相机深度启发式
+            ImGui::Text("自身:%s", 本机::状态文本());
         }
 
         ImGui::SetNextItemOpen(true, ImGuiCond_Once);
@@ -1265,7 +1484,11 @@ void Layout_tick_UI(bool *main_thread_flag) {
 
             ImGui::Checkbox("绘制调试", &Debugging);
             ImGui::SameLine();
-            ImGui::Checkbox("显示密码机", &show_draw_secret_mechine);
+            ImGui::Checkbox("显示密码机", &show_draw_secret_mechine);   // 进度/进度条/最后一台 都跟着它
+
+            ImGui::Checkbox("显示天赋", &show_draw_Genius);             // 天赋行 + 监管辅助特质行
+            ImGui::SameLine();
+            ImGui::Checkbox("显示大门", &show_draw_Door);
 
             // 发布版本: 注入功能已停用
             // ImGui::Checkbox("骨骼与进度", &show_sohook);

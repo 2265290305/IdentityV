@@ -20,6 +20,12 @@ cp config.example.py config.py   # 然后填写里面的值
 `config.py` 已在 `.gitignore` 里。所有目标相关的常量（包名、模块名、签名、偏移）
 都只存在于这个文件，工具本身不含任何目标特定值。
 
+**如果拿到的包里已经带了 `config.py`**：那是作者按 `2026.0917` 这版 `libclient.so`
+填好的，签名和偏移可以直接用，不用再从模板复制。**只需要改一项：`ADB`**。
+它默认写的是 `"adb"`，前提是 adb 在 PATH 里；不在的话，改成本机 `adb.exe` 的完整路径
+（Android SDK 默认装在 `<用户目录>\AppData\Local\Android\Sdk\platform-tools\adb.exe`）。
+游戏热更之后偏移可能会失效，重新定位的方法见仓库根目录的 `SKILL.md`。
+
 ## 用法
 
 ```bash
