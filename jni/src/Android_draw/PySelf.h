@@ -64,19 +64,34 @@ namespace 本机 {
 static const uintptr_t OFF_SYS_MODULES = 0xA7029E8;
 static const uintptr_t OFF_LONG_TYPE   = 0xA026498;
 static const uintptr_t OFF_DICT_TYPE   = 0xA023BF0;
+static const uintptr_t OFF_TRUE        = 0xA0261A0;   // True 单例(实测，跟 PyGenius.h 同源)
 
 static const int 最大废弃数 = 32;
+static const int 最大本体数 = 32;
 
-// 要扫 another_model 的单位类型：1=监管 2=求生者(机械玩偶也在这里) 236=梦之信徒
+// 要扫的单位类型：1=监管(巡视者也在这里) 2=求生者(机械玩偶、幻灯师分身也在这里) 236=梦之信徒
 static const int 单位类型表[] = {1, 2, 236};
 static const int 单位类型数 = sizeof(单位类型表) / sizeof(单位类型表[0]);
 
+// ---- 本体集合：哪些场景对象是"角色本体"(2026-09-22 实测) ----
+// 场景数组里跟角色同名、或者挂在角色身上的对象很多：_fragrance_image(每个求生者一份、同名、恒不可见)、
+// another_model(另一形态)、balloon_model/umbrella_model(挂件)、item_lst[i].model(手持道具)、
+// 时装挂件、约瑟夫相机……类名和 +0x240/+0x6D 都分不开(另一形态、气球跟本体一样是 2 / 0x50)。
+// 唯一干净的定义：units_by_type[1]/[2]/[236] 里每个单位的 unit.model + 0x20。
+//   - 魔术师分身是 CloneUnit，在独立的键 [17] 里，不在这张表里，自然排除
+//   - 幻灯师分身 SlideManCloneUnit 却在 [2] 里，靠 is_civilian_puppet == True 排除
+//     (它 is_clone=False、is_puppet=False，这两个名字都骗人，别用)
+//   - 机械玩偶 MyCivilianPuppetUnit 在 [2] 里、is_civilian_puppet=False，**保留**(用户要画它)
+//   - owner_uid 别用：机械玩偶实测为 None，可能只在被操控时才有值
 struct 快照 {
     uint64_t 锚点;                  // 当前操控单位的场景对象，0 = 没读到
     int      阵营;                  // 1=监管 2=求生者 其它=从属单位的 unit_type
     int64_t  uid;
     uint64_t 废弃[最大废弃数];
     int      废弃数;
+    uint64_t 本体[最大本体数];      // 本体集合，见上
+    int      本体数;
+    uint64_t 监管本体;              // [1] 里第一个类名不含 Puppet 的单位(跳过巡视者)，0 = 没有
 };
 
 // 双缓冲发布：写线程填非活跃缓冲，填完再翻转，绘制线程永远读到完整的一份
@@ -84,11 +99,24 @@ static 快照 g_缓冲[2];
 static volatile int g_活跃 = 0;
 
 static uintptr_t g_libbase = 0;
-static uint64_t  g_整数类型 = 0, g_字典类型 = 0;
+static uint64_t  g_整数类型 = 0, g_字典类型 = 0, g_真 = 0;
 static uint64_t  g_模块字典 = 0;
 static int64_t   g_i_cam = -1, g_i_cam_unit = -1;
 static int64_t   g_i_unit_mgr = -1, g_i_ubt = -1;
 static int64_t   g_i_model = -1, g_i_another = -1, g_i_utype = -1, g_i_uid = -1;
+// another_model 的序号缓存**按类分开存**(键 = 实例的 ob_type)。
+// 各玩家类(ButcherUnit / CivilianUnit / MyCivilianUnit / 各种 Puppet ...)实例字典大小不同，
+// another_model 的序号也不同；共用一个缓存时，遍历每换一个类就失效一次、从头按名字扫到它
+// (字典上千条，每条 2 次读取)，一轮要扫 2~4 次，占了这个线程九成的读取量。
+// 分开存之后每个类只在第一次出现时扫一次。缓存从不被直接信任：校准序号() 每次都按名字核对，
+// 核对不上就重扫，所以最坏情况就是退回共用缓存那种多扫几遍，不会读错属性。
+// 表满了(类比这个多)就退回共用的 g_i_*。model / is_civilian_puppet 同理，一起按类存。
+struct 类序号 { uint64_t 类型; int64_t 另形; int64_t 模型; int64_t 从属; bool 是Puppet; };
+static const int 最大类数 = 8;
+static 类序号 g_另形缓存[最大类数];
+static int     g_另形缓存数 = 0;
+static int64_t g_i_unit_model = -1, g_i_cpuppet = -1;   // 表满时的共用缓存
+
 static volatile bool g_可用 = false;
 static volatile int  g_连续失败 = 0;
 static char g_状态[96] = "未启动";
@@ -227,29 +255,76 @@ static bool 取列表(uint64_t L, int64_t &n, uint64_t &items)
     return 是对象(items);
 }
 
-// 扫一类单位的 another_model，把废弃形态的场景对象收进黑名单
-static void 收废弃(uint64_t ubt, int 类型, 快照 &出)
+// 类名(PyTypeObject.tp_name，+0x18 是 char*)里含不含 Puppet。
+// 实测 [1] 里的巡视者是 MyButcherPatrolPuppetUnit，挑"监管本体"时要跳过它
+static bool 类名含Puppet(uint64_t 类型)
+{
+    uint64_t np = getPtr64(类型 + 0x18);
+    if (!是对象(np)) return false;
+    char buf[48] = {0};                                // 最长的 MyButcherPatrolPuppetUnit 也才 25 字节
+    if (!vm_readv(np, buf, sizeof(buf) - 1)) return false;
+    return strstr(buf, "Puppet") != nullptr;
+}
+
+static inline void 收入(uint64_t *表, int &数, int 上限, uint64_t sp)
+{
+    for (int j = 0; j < 数; j++) if (表[j] == sp) return;
+    if (数 < 上限) 表[数++] = sp;
+}
+
+// 扫一类单位：
+//   another_model -> 废弃模型黑名单
+//   model         -> 本体集合(幻灯师分身 is_civilian_puppet==True 不收)
+//   [1] 里第一个类名不含 Puppet 的 -> 监管本体(预知监管用)
+static void 收单位(uint64_t ubt, int 类型, 快照 &出)
 {
     uint64_t 列表 = 取分类表(ubt, 类型);
     int64_t n = 0; uint64_t items = 0;
     if (!取列表(列表, n, items) || n == 0) return;
 
-    for (int64_t i = 0; i < n && 出.废弃数 < 最大废弃数; i++) {
+    for (int64_t i = 0; i < n; i++) {
         uint64_t inst = getPtr64(items + i * 8);
         uint64_t d = 取实例字典(inst);
         if (!d) continue;
         字典 dk;
         if (!取字典(d, dk)) continue;
 
-        // another_model 只存在于有第二形态的角色身上，其余单位查不到就跳过(不是错误)
-        g_i_another = 校准序号(d, dk, g_i_another, "another_model");
-        if (g_i_another < 0) continue;
-        uint64_t sp = 取场景对象(getPtr64(值槽(dk, g_i_another)));
-        if (!sp) continue;
+        // 按实例的类取序号缓存(见 g_另形缓存)。类型指针读不到、或表满了就用共用缓存
+        uint64_t 类型 = getPtr64(inst + 8);
+        类序号 *槽 = nullptr;
+        if (是对象(类型)) {
+            for (int j = 0; j < g_另形缓存数; j++)
+                if (g_另形缓存[j].类型 == 类型) { 槽 = &g_另形缓存[j]; break; }
+            if (!槽 && g_另形缓存数 < 最大类数) {
+                槽 = &g_另形缓存[g_另形缓存数++];
+                槽->类型 = 类型;
+                槽->另形 = 槽->模型 = 槽->从属 = -1;
+                槽->是Puppet = 类名含Puppet(类型);    // 类名一个类只读一次
+            }
+        }
+        int64_t &另形 = 槽 ? 槽->另形 : g_i_another;
+        int64_t &模型 = 槽 ? 槽->模型 : g_i_unit_model;
+        int64_t &从属 = 槽 ? 槽->从属 : g_i_cpuppet;
 
-        bool 已有 = false;
-        for (int j = 0; j < 出.废弃数; j++) if (出.废弃[j] == sp) { 已有 = true; break; }
-        if (!已有) 出.废弃[出.废弃数++] = sp;
+        // 实测所有玩家类都有 another_model(没有第二形态时值是 None)，查不到就跳过(不是错误)
+        另形 = 校准序号(d, dk, 另形, "another_model");
+        if (另形 >= 0) {
+            uint64_t sp = 取场景对象(getPtr64(值槽(dk, 另形)));
+            if (sp) 收入(出.废弃, 出.废弃数, 最大废弃数, sp);
+        }
+
+        模型 = 校准序号(d, dk, 模型, "model");
+        if (模型 < 0) continue;
+        uint64_t 本体 = 取场景对象(getPtr64(值槽(dk, 模型)));
+        if (!本体) continue;
+
+        // 幻灯师分身：is_civilian_puppet 是 True 单例。属性不存在(监管类)或读不到都按"不是分身"
+        从属 = 校准序号(d, dk, 从属, "is_civilian_puppet");
+        if (从属 >= 0 && getPtr64(值槽(dk, 从属)) == g_真) continue;
+
+        收入(出.本体, 出.本体数, 最大本体数, 本体);
+        if (类型 == 1 && 出.监管本体 == 0 && !(槽 ? 槽->是Puppet : 类名含Puppet(getPtr64(inst + 8))))
+            出.监管本体 = 本体;
     }
 }
 
@@ -290,7 +365,7 @@ static bool 尝试刷新()
 
     if (出.锚点 == 0) { snprintf(g_状态, sizeof(g_状态), "cam.unit.model 读不到"); return false; }
 
-    // ---- 二、废弃模型黑名单 ----
+    // ---- 二、废弃模型黑名单 + 本体集合 + 监管本体 ----
     g_i_unit_mgr = 查名(g_模块字典, "unit_mgr", g_i_unit_mgr);
     uint64_t um = (g_i_unit_mgr >= 0) ? 取属性(g_模块字典, g_i_unit_mgr) : 0;
     uint64_t ud = 取实例字典(um);
@@ -298,16 +373,16 @@ static bool 尝试刷新()
         g_i_ubt = 查名(ud, "units_by_type", g_i_ubt);
         uint64_t ubt = (g_i_ubt >= 0) ? 取属性(ud, g_i_ubt) : 0;
         if (是对象(ubt))
-            for (int i = 0; i < 单位类型数; i++) 收废弃(ubt, 单位类型表[i], 出);
+            for (int i = 0; i < 单位类型数; i++) 收单位(ubt, 单位类型表[i], 出);
     }
-    // 黑名单读不到不算失败：锚点已经拿到了，绘制照样能用
+    // 这一段读不到不算失败：锚点已经拿到了。本体数为 0 时绘制侧会退回按类名画
 
     int 写 = 1 - g_活跃;
     g_缓冲[写] = 出;
     g_活跃 = 写;                                   // 填完再翻转
-    snprintf(g_状态, sizeof(g_状态), "正常 %s uid=%lld 废弃%d",
+    snprintf(g_状态, sizeof(g_状态), "正常 %s uid=%lld 本体%d 废弃%d",
              出.阵营 == 1 ? "监管" : (出.阵营 == 2 ? "求生" : "从属"),
-             (long long)出.uid, 出.废弃数);
+             (long long)出.uid, 出.本体数, 出.废弃数);
     return true;
 }
 
@@ -320,12 +395,14 @@ static void 刷新一次()
         g_模块字典 = 0;
         g_i_cam = g_i_cam_unit = g_i_unit_mgr = g_i_ubt = -1;
         g_i_model = g_i_another = g_i_utype = g_i_uid = -1;
+        g_i_unit_model = g_i_cpuppet = -1;
+        g_另形缓存数 = 0;
         g_连续失败 = 0;
     }
 }
 
-// 自身锚点每帧都要用，而且切换操控对象时要立刻跟上，所以比天赋刷得勤
-static const int 刷新间隔毫秒 = 100;
+// 自身锚点每帧都要用，而且切换操控对象时要立刻跟上，所以比天赋刷得勤(约一帧 60fps)
+static const int 刷新间隔毫秒 = 16;
 
 static void 线程体()
 {
@@ -341,6 +418,7 @@ static void 启动(uintptr_t libbase)
     g_libbase   = libbase;
     g_整数类型 = libbase + OFF_LONG_TYPE;
     g_字典类型 = libbase + OFF_DICT_TYPE;
+    g_真       = libbase + OFF_TRUE;
     snprintf(g_状态, sizeof(g_状态), "启动中");
     std::thread(线程体).detach();
     printf("[自身] 已启动 libbase=0x%lx\n", (unsigned long)libbase);
@@ -374,6 +452,28 @@ static bool 是废弃模型(uintptr_t obj)
     const 快照 &s = g_缓冲[g_活跃];
     for (int i = 0; i < s.废弃数; i++) if (s.废弃[i] == (uint64_t)obj) return true;
     return false;
+}
+
+// 本体集合能不能用。准备阶段/大厅里 units_by_type 没有 [1]/[2](实测两次)，这里就是 false，
+// 绘制侧据此退回按类名画 —— 所以它同时也是"是否在局内"的信号
+static inline bool 本体集合可用() { return g_可用 && g_缓冲[g_活跃].本体数 > 0; }
+
+static bool 是本体(uintptr_t obj)
+{
+    if (!g_可用) return false;
+    const 快照 &s = g_缓冲[g_活跃];
+    for (int i = 0; i < s.本体数; i++) if (s.本体[i] == (uint64_t)obj) return true;
+    return false;
+}
+
+// 局内监管本体的场景对象(跳过巡视者)。准备阶段没有 [1] 单位，返回 false
+static bool 监管本体(uint64_t &obj)
+{
+    if (!g_可用) return false;
+    uint64_t v = g_缓冲[g_活跃].监管本体;
+    if (v == 0) return false;
+    obj = v;
+    return true;
 }
 
 } // namespace 本机

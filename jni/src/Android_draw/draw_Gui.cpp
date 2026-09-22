@@ -665,7 +665,16 @@ void read_thread(long int PD1,long int PD2,long int PD3)
         	}
         	std::string s;
         	//预知监管者
-            if (show_draw_prophet){//预知开始
+            // 局内：CPython 侧有监管单位，直接取它 unit.model 对应的场景对象的类名。
+            //   这样另一形态(无常黑白)、约瑟夫相机、大厅残留都不会顶掉真监管。
+            // 准备阶段/大厅：units_by_type 里还没有监管单位(实测)，退回下面按类名匹配的老逻辑。
+            //   ⚠ 准备阶段不能用 +0x73(visible) 过滤：打求生者时真监管的模型在准备界面是不可见的(实测)
+            uint64_t 真监管 = 0;
+            const bool 有真监管 = 本机::监管本体(真监管);
+            if (show_draw_prophet && 有真监管){
+                if (对象 == 真监管) sprintf(监管者预知, "%s", getboss(过滤类名.c_str()));
+            }
+            else if (show_draw_prophet){//预知开始
                 if (strstr(过滤类名.c_str(), "burke_console") == NULL&&strstr(过滤类名.c_str(), "h55_joseph_camera") == NULL&&strstr(过滤类名.c_str(), "redqueen_e_heijin_yizi") == NULL&&strstr(过滤类名.c_str(), "_lod") == NULL){
                     if (strstr(过滤类名.c_str(), "boss") != NULL){
                         s += getboss(过滤类名.c_str());
@@ -1034,6 +1043,16 @@ void Draw_Main(ImDrawList *Draw){
             continue; // 不管有效无效, 自身都不需要再走下面的常规实体流程
         }
 
+        // 只画角色本体：CPython 侧 units_by_type[1]/[2]/[236] 的 unit.model 对应的场景对象(见 PySelf.h 本体集合)。
+        // 挡掉同名分身副本(_fragrance_image)、另一形态、挂件、时装、魔术师/幻灯师分身；机械玩偶保留。
+        // 只管按 player/boss 类名归进 1/2 的对象 —— 类名分类那里另有两个特例(deluosi 鬼魂、火箭挂件)
+        // 被故意归成求生者，它们不是任何单位的 model，不能被这层挡掉。
+        // 本体集合不可用(准备阶段/大厅/读取失败)时不过滤，照旧按类名画。
+        if ((data[i].阵营 == 1 || data[i].阵营 == 2) && 本机::本体集合可用()
+            && (strstr(data[i].类名, "player") != NULL || strstr(data[i].类名, "boss") != NULL)
+            && !本机::是本体(data[i].obj))
+            continue;
+
         if (D.X==0 || D.Y==0){
 		    continue;//跳过xy0
 		}
@@ -1239,8 +1258,15 @@ void Draw_Main(ImDrawList *Draw){
                
                 std::string s;
 
+                // 离自己 1 米以内的角色不画方框和附带数据(名字/距离/天赋/特质/射线)：
+                // 贴身的基本是自己身上的其它模型(备用形态、残留模型)，画出来只会挡视线。
+                // 全局 距离 是 int，不到 1 米会截断成 0，这里必须用浮点重算。
+                // 角色原点都在脚底，用三维距离即可(道具那边是挂点偏高才只能算水平距离)。
+                // 没有自身锚点时 Z 不可信，不做这层过滤。
+                float 离自身 = sqrtf(powf(D.X - Z.X, 2) + powf(D.Y - Z.Y, 2) + powf(D.Z - Z.Z, 2)) / 距离比例;
+                bool 贴身 = (自身 != 0) && 离自身 < 1.0f;
 
-                if (!模仿者绘制中 && (data[i].阵营==1||data[i].阵营==2)){
+                if (!模仿者绘制中 && !贴身 && (data[i].阵营==1||data[i].阵营==2)){
                     s+=data[i].str;
                     auto textSize = ImGui::CalcTextSize(s.c_str(), 0, 25);
                     Draw->AddText({X1 + W/2-(textSize.x/2),Y1-45}, ImColor(255,200,0,255), s.c_str());
