@@ -1267,9 +1267,9 @@ void Draw_Main(ImDrawList *Draw){
                     if (show_draw_Genius){
                         天赋::信息 gi;
                         if (天赋::查询(data[i].obj, D.X, D.Y, gi)){
-                            char 天赋行[64];
-                            天赋::天赋文本(gi, 天赋行, sizeof(天赋行));
-                            if (天赋行[0]){
+                            天赋::天赋行段 段;
+                            天赋::天赋分段(gi, 段);
+                            if (段.前[0] || 段.飞轮[0] || 段.后[0]){
                                 // 绝处逢生三态：没带=白 / 带了还没用=绿 / 带了已经用掉=灰。
                                 // 消耗标志是 unit.ability_used[102]，2026-09-22 实测**别人的也读得到**
                                 // (服务器会下发非本机玩家的消耗状态)，所以监管看四个人都准。
@@ -1282,8 +1282,15 @@ void Draw_Main(ImDrawList *Draw){
                                     case 天赋::绝处_未知:
                                     default:              c = ImColor(255,255,255,255); break;
                                 }
-                                auto ts = ImGui::CalcTextSize(天赋行, 0, 25);
-                                Draw->AddText({X1 + W/2-(ts.x/2),下一行}, c, 天赋行);
+                                // 飞轮就绪时"飞轮"两个字画红，优先于上面的整行配色
+                                ImColor 飞轮色 = 段.飞轮就绪 ? 红色 : c;
+                                float w前 = ImGui::CalcTextSize(段.前, 0, 25).x;
+                                float w轮 = ImGui::CalcTextSize(段.飞轮, 0, 25).x;
+                                float w后 = ImGui::CalcTextSize(段.后, 0, 25).x;
+                                float tx = X1 + W/2 - (w前 + w轮 + w后)/2;
+                                if (段.前[0])   Draw->AddText({tx, 下一行}, c, 段.前);
+                                if (段.飞轮[0]) Draw->AddText({tx + w前, 下一行}, 飞轮色, 段.飞轮);
+                                if (段.后[0])   Draw->AddText({tx + w前 + w轮, 下一行}, c, 段.后);
                                 下一行 += 行高;
                             }
                             // 监管再单独一行写当前辅助特质 + 剩余冷却

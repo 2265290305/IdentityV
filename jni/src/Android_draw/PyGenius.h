@@ -80,6 +80,13 @@ static const int CIVILIAN_UNIT_TYPE = 2;
 // 这个属性只存在于求生者类上，监管(MyButcherUnit)身上根本没有。
 static const int 被动_绝处逢生 = 102;
 
+// 飞轮效应(求生者天赋 8，被动 207)的**技能 id**。被动配表
+// passive_skill_data[(207,1)]['active_skills'] = (11111,)，冷却挂在 skill_dict[11111] 上：
+// SkillFlywheelSprint，cd_time 135、game_start_cd 50，_cd_delta 每秒 -1(2026-09-22 注入实测)。
+// ⚠ 配表里那个 skill_cd = 10.0 不是飞轮冷却。
+// ⚠ 只在本机玩家身上验过；非本机求生者的 skill_dict 里有没有它还没验(那局没人带)。
+static const int 技能_飞轮 = 11111;
+
 // 天赋 id -> 位号。只关心四个分支终端 + 26(求生者的绝处逢生)，其余忽略。
 // 两个阵营共用这张 id->位 的映射，名字在格式化时才按阵营区分。
 enum {
@@ -105,6 +112,11 @@ struct 信息 {
     float    冷却总长;   // cd_time，画进度环用
     int      充能最大;   // power_num，非充能型为 0
     int      充能当前;   // _cur_power_num
+    // 求生者飞轮效应的冷却(skill_dict[技能_飞轮])，监管侧全为 0
+    bool     有飞轮;     // skill_dict 里有飞轮技能且读到了 _cd_delta
+    float    飞轮剩余;   // 秒，0 = 就绪。读到那一刻的值
+    int64_t  飞轮时刻;   // 现在毫秒() 时钟
+    float    飞轮速率;   // skill_mgr.cd_rate
 };
 
 struct 条目 {
@@ -506,54 +518,85 @@ static bool 是特质主技能(int 特质, int64_t sid)
     return false;
 }
 
-static void 收监管技能(uint64_t d, const 字典 &dk, int 特质, 信息 &出)
+// unit.skill_mgr -> skill_dict 的条目表。监管和求生者共用。
+// 速率 = skill_mgr.cd_rate：实测恒为 int 1，但名字说明它能变(加速冷却类效果)，读不到就按 1
+static bool 取技能表(uint64_t d, const 字典 &dk, 字典 &sdk, float &速率)
 {
-    if (特质 < 1 || 特质 > 8) return;
+    速率 = 1.f;
     g_i_skillmgr = 校准序号(d, dk, g_i_skillmgr, "skill_mgr");
-    if (g_i_skillmgr < 0) return;
+    if (g_i_skillmgr < 0) return false;
     uint64_t sm = getPtr64(值槽(dk, g_i_skillmgr));
-    if (!是对象(sm)) return;
+    if (!是对象(sm)) return false;
     uint64_t smd = getPtr64(sm - 0x18);
     字典 smk;
-    if (!取字典(smd, smk)) return;
+    if (!取字典(smd, smk)) return false;
 
     g_i_skilldict = 校准序号(smd, smk, g_i_skilldict, "skill_dict");
-    if (g_i_skilldict < 0) return;
-    // cd_rate 实测恒为 int 1，但名字说明它能变(加速冷却类效果)。读不到就按 1
-    float 速率 = 1.f;
+    if (g_i_skilldict < 0) return false;
     g_i_cdrate = 校准序号(smd, smk, g_i_cdrate, "cd_rate");
     if (g_i_cdrate >= 0 && !读浮点(值槽(smk, g_i_cdrate), 速率, 0.01f, 10.f)) 速率 = 1.f;
     uint64_t sd = getPtr64(值槽(smk, g_i_skilldict));
-    字典 sdk;
-    if (!是对象(sd) || getPtr64(sd + 8) != g_字典类型 || !取字典(sd, sdk)) return;
+    return 是对象(sd) && getPtr64(sd + 8) == g_字典类型 && 取字典(sd, sdk);
+}
+
+// 读一个 Skill 对象的冷却。_cd_delta 读不到返回 false(不显示冷却，不猜)，其余几项读不到就保持原值
+static bool 读技能冷却(uint64_t sk, float &剩余, float &总长, int &充能最大, int &充能当前)
+{
+    if (!是对象(sk)) return false;
+    uint64_t skd = getPtr64(sk - 0x18);
+    字典 skk;
+    if (!取字典(skd, skk)) return false;
+
+    g_i_cd       = 校准序号(skd, skk, g_i_cd,       "_cd_delta");
+    g_i_cdtime   = 校准序号(skd, skk, g_i_cdtime,   "cd_time");
+    g_i_power    = 校准序号(skd, skk, g_i_power,    "power_num");
+    g_i_curpower = 校准序号(skd, skk, g_i_curpower, "_cur_power_num");
+    if (g_i_cd < 0) return false;
+    if (!读浮点(值槽(skk, g_i_cd), 剩余, -0.5f, 600.0f)) return false;
+
+    if (g_i_cdtime >= 0) 读浮点(值槽(skk, g_i_cdtime), 总长, 0.f, 600.f);
+    int64_t v = 0;
+    if (g_i_power    >= 0 && 读整数(getPtr64(值槽(skk, g_i_power)),    v) && v > 0 && v < 16) 充能最大 = (int)v;
+    if (g_i_curpower >= 0 && 读整数(getPtr64(值槽(skk, g_i_curpower)), v) && v >= 0 && v < 16) 充能当前 = (int)v;
+    return true;
+}
+
+static void 收监管技能(uint64_t d, const 字典 &dk, int 特质, 信息 &出)
+{
+    if (特质 < 1 || 特质 > 8) return;
+    字典 sdk; float 速率;
+    if (!取技能表(d, dk, sdk, 速率)) return;
 
     for (int64_t i = 0; i < sdk.条数; i++) {
         int64_t sid = 0;
         if (!读整数(getPtr64(键槽(sdk, i)), sid)) continue;
         if (!是特质主技能(特质, sid)) continue;          // 先按 id 筛，只解那一个技能对象
-        uint64_t sk = getPtr64(值槽(sdk, i));
-        if (!是对象(sk)) continue;
-        uint64_t skd = getPtr64(sk - 0x18);
-        字典 skk;
-        if (!取字典(skd, skk)) continue;
-
-        g_i_cd       = 校准序号(skd, skk, g_i_cd,       "_cd_delta");
-        g_i_cdtime   = 校准序号(skd, skk, g_i_cdtime,   "cd_time");
-        g_i_power    = 校准序号(skd, skk, g_i_power,    "power_num");
-        g_i_curpower = 校准序号(skd, skk, g_i_curpower, "_cur_power_num");
-        if (g_i_cd < 0) return;
-
         float cd = 0.f;
-        if (!读浮点(值槽(skk, g_i_cd), cd, -0.5f, 600.0f)) return;   // 读失败就不显示冷却，不猜
+        if (!读技能冷却(getPtr64(值槽(sdk, i)), cd, 出.冷却总长, 出.充能最大, 出.充能当前)) return;
         出.冷却剩余 = cd;
         出.读到时刻 = 现在毫秒();
         出.冷却速率 = 速率;
         出.有冷却   = true;
-        if (g_i_cdtime >= 0) 读浮点(值槽(skk, g_i_cdtime), 出.冷却总长, 0.f, 600.f);
-        int64_t v = 0;
-        if (g_i_power    >= 0 && 读整数(getPtr64(值槽(skk, g_i_power)),    v) && v > 0 && v < 16) 出.充能最大 = (int)v;
-        if (g_i_curpower >= 0 && 读整数(getPtr64(值槽(skk, g_i_curpower)), v) && v >= 0 && v < 16) 出.充能当前 = (int)v;
         return;                                        // 一个监管只挂一个主技能
+    }
+}
+
+// 求生者的飞轮效应冷却。skill_dict 里没有 11111 = 没带飞轮(或这一轮没读到)，什么都不填
+static void 收飞轮(uint64_t d, const 字典 &dk, 信息 &出)
+{
+    字典 sdk; float 速率;
+    if (!取技能表(d, dk, sdk, 速率)) return;
+
+    for (int64_t i = 0; i < sdk.条数; i++) {
+        int64_t sid = 0;
+        if (!读整数(getPtr64(键槽(sdk, i)), sid) || sid != 技能_飞轮) continue;
+        float cd = 0.f, 总长 = 0.f; int 满 = 0, 当前 = 0;
+        if (!读技能冷却(getPtr64(值槽(sdk, i)), cd, 总长, 满, 当前)) return;
+        出.飞轮剩余 = cd;
+        出.飞轮时刻 = 现在毫秒();
+        出.飞轮速率 = 速率;
+        出.有飞轮   = true;
+        return;
     }
 }
 
@@ -630,6 +673,7 @@ static int 收一类(uint64_t ubt, int 类型, int 写, int 个数)
             memcpy(inf.天赋等级, 记->等级, sizeof(inf.天赋等级));
         }
         if (类型 == BUTCHER_UNIT_TYPE) 收监管技能(d, dk, 特质, inf);
+        else                           收飞轮(d, dk, inf);
 
         g_缓冲[写][个数].info = inf;
         个数++;
@@ -753,31 +797,6 @@ static inline int 绝处状态(const 信息 &g)
     return g.天赋状态 == 天赋_完整 ? 绝处_无 : 绝处_未知;
 }
 
-// 天赋简称行。求生者大心脏排最后，监管挽留排最后。写不出内容时 buf 为空串
-//   未知：空串(不画)
-//   部分：已确认的大天赋 + "?"，表示可能还有没读到的
-//   完整：全部大天赋；一个大天赋都没带就写"无"
-static void 天赋文本(const 信息 &g, char *buf, size_t cap)
-{
-    buf[0] = '\0';
-    if (g.天赋状态 == 天赋_未知) return;
-    char tmp[64]; tmp[0] = '\0';
-    if (g.阵营 == CIVILIAN_UNIT_TYPE) {
-        if (g.天赋位 & 位_卅二) strncat(tmp, "双弹", sizeof(tmp) - strlen(tmp) - 1);
-        if (g.天赋位 & 位_八)   strncat(tmp, "飞轮", sizeof(tmp) - strlen(tmp) - 1);
-        if (g.天赋位 & 位_廿四) strncat(tmp, "搏命", sizeof(tmp) - strlen(tmp) - 1);
-        if (g.天赋位 & 位_十六) strncat(tmp, "大心脏", sizeof(tmp) - strlen(tmp) - 1);  // 固定排最后
-    } else {
-        if (g.天赋位 & 位_八)   strncat(tmp, "封窗", sizeof(tmp) - strlen(tmp) - 1);
-        if (g.天赋位 & 位_十六) strncat(tmp, "底牌", sizeof(tmp) - strlen(tmp) - 1);
-        if (g.天赋位 & 位_卅二) strncat(tmp, "张狂", sizeof(tmp) - strlen(tmp) - 1);
-        if (g.天赋位 & 位_廿四) strncat(tmp, "挽留", sizeof(tmp) - strlen(tmp) - 1);    // 固定排最后
-    }
-    if (g.天赋状态 == 天赋_部分)      strncat(tmp, "?", sizeof(tmp) - strlen(tmp) - 1);
-    else if (tmp[0] == '\0')          snprintf(tmp, sizeof(tmp), "无");
-    snprintf(buf, cap, "%s", tmp);
-}
-
 // 监管辅助特质那一行的完整文本：特质名 + 冷却/充能。
 //   普通技能   "闪现 12.7s" / "闪现 就绪"
 //   充能型技能 "窥视者 2/3 20.9s"(还在攒下一层) / "窥视者 3/3"(满层)
@@ -804,16 +823,54 @@ static const char *特质名(int id)
 // _cd_delta 实测严格按每秒 -1(乘 cd_rate)递减，所以绘制时从"读到的值"按经过的时间往下推。
 // 推到 0 以下只停在 0.0，**不自己判就绪** —— 就绪以真正读到的 0 为准(见 已就绪())，
 // 否则底牌改写冷却、或者推算略快时会误报。下一轮读取会覆盖推算值，误差不超过一个读取周期。
+static float 推算(float 读值, int64_t 时刻, float 速率)
+{
+    if (读值 <= 0.05f) return 0.f;
+    if (速率 <= 0.f) 速率 = 1.f;
+    float r = 读值 - (float)(现在毫秒() - 时刻) / 1000.f * 速率;
+    return r > 0.f ? r : 0.f;
+}
 static float 推算剩余(const 信息 &g)
 {
-    if (!g.有冷却 || g.冷却剩余 <= 0.05f) return 0.f;
-    float 速率 = g.冷却速率 > 0.f ? g.冷却速率 : 1.f;
-    float r = g.冷却剩余 - (float)(现在毫秒() - g.读到时刻) / 1000.f * 速率;
-    return r > 0.f ? r : 0.f;
+    return g.有冷却 ? 推算(g.冷却剩余, g.读到时刻, g.冷却速率) : 0.f;
 }
 
 // 就绪 = 真正读到 0(不是推算到 0)
 static inline bool 已就绪(const 信息 &g) { return g.有冷却 && g.冷却剩余 <= 0.05f; }
+static inline bool 飞轮就绪(const 信息 &g) { return g.有飞轮 && g.飞轮剩余 <= 0.05f; }
+
+// 天赋简称行，拆成 前 / 飞轮 / 后 三段，飞轮单独一段好让绘制侧单独上色。
+// 求生者：双弹 [飞轮] 搏命 大心脏(固定最后)；监管全部在"前"段：封窗 底牌 张狂 挽留(固定最后)。
+//   未知：三段全空(不画)
+//   部分：已确认的大天赋 + "?"，表示可能还有没读到的
+//   完整：全部大天赋；一个大天赋都没带就写"无"
+// 飞轮段：就绪 "飞轮"(飞轮就绪=true，画红) / 冷却中 "飞轮13s" / 没读到冷却 "飞轮"。
+// skill_dict 里有飞轮技能本身就证明带了飞轮，所以天赋表读不全(未知/部分)时也照样显示它。
+struct 天赋行段 { char 前[48]; char 飞轮[24]; char 后[48]; bool 飞轮就绪; };
+static void 天赋分段(const 信息 &g, 天赋行段 &o)
+{
+    memset(&o, 0, sizeof(o));
+    bool 求生 = (g.阵营 == CIVILIAN_UNIT_TYPE);
+    bool 带飞轮 = 求生 && ((g.天赋位 & 位_八) || g.有飞轮);
+    if (g.天赋状态 == 天赋_未知 && !带飞轮) return;
+    if (求生) {
+        if (g.天赋位 & 位_卅二) strncat(o.前, "双弹", sizeof(o.前) - strlen(o.前) - 1);
+        if (带飞轮) {
+            if (飞轮就绪(g)) { snprintf(o.飞轮, sizeof(o.飞轮), "飞轮"); o.飞轮就绪 = true; }
+            else if (g.有飞轮) snprintf(o.飞轮, sizeof(o.飞轮), "飞轮%.0fs", 推算(g.飞轮剩余, g.飞轮时刻, g.飞轮速率));
+            else               snprintf(o.飞轮, sizeof(o.飞轮), "飞轮");
+        }
+        if (g.天赋位 & 位_廿四) strncat(o.后, "搏命", sizeof(o.后) - strlen(o.后) - 1);
+        if (g.天赋位 & 位_十六) strncat(o.后, "大心脏", sizeof(o.后) - strlen(o.后) - 1);
+    } else {
+        if (g.天赋位 & 位_八)   strncat(o.前, "封窗", sizeof(o.前) - strlen(o.前) - 1);
+        if (g.天赋位 & 位_十六) strncat(o.前, "底牌", sizeof(o.前) - strlen(o.前) - 1);
+        if (g.天赋位 & 位_卅二) strncat(o.前, "张狂", sizeof(o.前) - strlen(o.前) - 1);
+        if (g.天赋位 & 位_廿四) strncat(o.前, "挽留", sizeof(o.前) - strlen(o.前) - 1);
+    }
+    if (g.天赋状态 != 天赋_完整) strncat(o.后, "?", sizeof(o.后) - strlen(o.后) - 1);
+    else if (!o.前[0] && !o.飞轮[0] && !o.后[0]) snprintf(o.前, sizeof(o.前), "无");
+}
 
 static void 特质行文本(const 信息 &g, const char *名, char *buf, size_t cap)
 {
