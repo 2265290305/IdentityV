@@ -6,7 +6,7 @@
 // ============================================================================
 //
 // 链路跟 PyProgress.h 完全一样(sys.modules -> game_kernel -> unit_mgr ->
-// units_by_type)，只是取的是 1(ButcherUnit) 和 2(CivilianUnit) 两个键，
+// units_by_type)，只是取的是 1(ButcherUnit)、2(CivilianUnit)、236(梦之信徒，只读冷却) 三个键，
 // 读的属性不同。CPython 3.11 的结构布局、防竞态读法、按名字查找+序号缓存
 // 这些共通的东西在 PyProgress.h 文件头有完整说明，这里不重复。
 //
@@ -69,9 +69,13 @@ static const uintptr_t OFF_DICT_TYPE   = 0xA023BF0;
 static const uintptr_t OFF_TRUE        = 0xA0261A0;   // True  单例(实测，顺序与直觉相反)
 static const uintptr_t OFF_FALSE       = 0xA0261C0;   // False 单例
 
-static const int 最大单位数 = 16;
+static const int 最大单位数 = 24;   // 1 监管 + 4 求生者 + 梦之信徒(实测一局 5 个) + 余量
 static const int BUTCHER_UNIT_TYPE  = 1;
 static const int CIVILIAN_UNIT_TYPE = 2;
+// 梦之女巫的信徒(YidhraPuppetUnit)。2026-09-22 实测(求生者视角读对面女巫)：每个信徒有**自己的**
+// skill_mgr / skill_dict / 711 闪现技能对象，_cd_delta 各自独立递减；support_skill_id 与本体相同([7])。
+// 所以按特质找主技能那套逻辑原样适用。信徒不读天赋/绝处逢生，只要冷却
+static const int YIDHRA_PUPPET_UNIT_TYPE = 236;
 
 // 绝处逢生的**被动技能 id**(不是天赋 id)。天赋 id 是 26，落地成被动是 102。
 // unit.ability_used 是 dict{被动id: bool}，True = 本局已消耗。
@@ -98,7 +102,7 @@ enum {
 };
 
 struct 信息 {
-    int      阵营;       // 1=监管 2=求生
+    int      阵营;       // 1=监管 2=求生 236=梦之信徒(只有特质冷却，天赋状态恒为未知)
     uint32_t 天赋位;     // 只含**已确认**的条目
     int      辅助特质;   // 1..8，0=没读到
     int      天赋状态;   // 天赋_未知 / 天赋_部分 / 天赋_完整，见 读天赋()
@@ -613,23 +617,28 @@ static int 收一类(uint64_t ubt, int 类型, int 写, int 个数)
         字典 dk;
         if (!取字典(d, dk)) continue;
 
-        g_i_genius  = 校准序号(d, dk, g_i_genius,  "genius_id_lv_lst");
+        const bool 信徒 = (类型 == YIDHRA_PUPPET_UNIT_TYPE);
         g_i_support = 校准序号(d, dk, g_i_support, "support_skill_id");
         g_i_model   = 校准序号(d, dk, g_i_model,   "model");
         g_i_pos     = 校准序号(d, dk, g_i_pos,     "position");
-        g_i_uid     = 校准序号(d, dk, g_i_uid,     "uid");
-        // 只在求生者类上找 ability_used：监管类上没这个属性，每个单位白扫一遍上千条不值
-        if (类型 == CIVILIAN_UNIT_TYPE)
-            g_i_ability = 校准序号(d, dk, g_i_ability, "ability_used");
-        if (g_i_genius < 0) continue;
 
-        int64_t uid = 0;
-        bool 有uid = (g_i_uid >= 0) && 读整数(getPtr64(值槽(dk, g_i_uid)), uid);
+        记忆项 *记 = nullptr;
+        if (!信徒) {                                   // 信徒不读天赋，也不占天赋记忆
+            g_i_genius = 校准序号(d, dk, g_i_genius, "genius_id_lv_lst");
+            g_i_uid    = 校准序号(d, dk, g_i_uid,    "uid");
+            // 只在求生者类上找 ability_used：监管类上没这个属性，每个单位白扫一遍上千条不值
+            if (类型 == CIVILIAN_UNIT_TYPE)
+                g_i_ability = 校准序号(d, dk, g_i_ability, "ability_used");
+            if (g_i_genius < 0) continue;
 
-        // 天赋按 uid 增量累积(见 读天赋())。这一轮 uid 读不到时天赋状态记为未知(只影响这一轮的显示)，
-        // 记忆本身不动，下一轮读到 uid 会接着用
-        记忆项 *记 = 有uid ? 取记忆(uid) : nullptr;
-        if (记) 读天赋(值槽(dk, g_i_genius), *记);
+            int64_t uid = 0;
+            bool 有uid = (g_i_uid >= 0) && 读整数(getPtr64(值槽(dk, g_i_uid)), uid);
+
+            // 天赋按 uid 增量累积(见 读天赋())。这一轮 uid 读不到时天赋状态记为未知(只影响这一轮的显示)，
+            // 记忆本身不动，下一轮读到 uid 会接着用
+            记 = 有uid ? 取记忆(uid) : nullptr;
+            if (记) 读天赋(值槽(dk, g_i_genius), *记);
+        }
 
         int 特质 = 0;
         if (g_i_support >= 0) {
@@ -672,8 +681,8 @@ static int 收一类(uint64_t ubt, int 类型, int 写, int 个数)
             inf.天赋状态 = 记忆状态(*记);
             memcpy(inf.天赋等级, 记->等级, sizeof(inf.天赋等级));
         }
-        if (类型 == BUTCHER_UNIT_TYPE) 收监管技能(d, dk, 特质, inf);
-        else                           收飞轮(d, dk, inf);
+        if (类型 == BUTCHER_UNIT_TYPE || 信徒) 收监管技能(d, dk, 特质, inf);
+        else                                  收飞轮(d, dk, inf);
 
         g_缓冲[写][个数].info = inf;
         个数++;
@@ -705,6 +714,7 @@ static bool 尝试刷新()
     // 所以每个单位都会走一次"按名字校验，不对就重扫"，多花的时间可以忽略
     个数 = 收一类(ubt, BUTCHER_UNIT_TYPE,  写, 个数);
     个数 = 收一类(ubt, CIVILIAN_UNIT_TYPE, 写, 个数);
+    个数 = 收一类(ubt, YIDHRA_PUPPET_UNIT_TYPE, 写, 个数);   // 没有女巫时这个键不存在，直接返回
 
     if (个数 == 0) { snprintf(g_状态, sizeof(g_状态), "一个单位也没读出"); return false; }
     g_计数[写] = 个数;

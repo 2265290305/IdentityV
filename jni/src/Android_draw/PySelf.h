@@ -70,14 +70,16 @@ static const int 最大废弃数 = 32;
 static const int 最大本体数 = 32;
 
 // 要扫的单位类型：1=监管(巡视者也在这里) 2=求生者(机械玩偶、幻灯师分身也在这里) 236=梦之信徒
-static const int 单位类型表[] = {1, 2, 236};
+// 1065=伊斯人幻影(yith_ghost03，2026-09-22 实测；漏了它时幻影被本体集合挡掉)。
+// 局中召出来的从属单位常有独立的键，某个召唤物被误挡时先用 _scripts\cmd_phase.py 查它在哪个键下
+static const int 单位类型表[] = {1, 2, 236, 1065};
 static const int 单位类型数 = sizeof(单位类型表) / sizeof(单位类型表[0]);
 
 // ---- 本体集合：哪些场景对象是"角色本体"(2026-09-22 实测) ----
 // 场景数组里跟角色同名、或者挂在角色身上的对象很多：_fragrance_image(每个求生者一份、同名、恒不可见)、
 // another_model(另一形态)、balloon_model/umbrella_model(挂件)、item_lst[i].model(手持道具)、
 // 时装挂件、约瑟夫相机……类名和 +0x240/+0x6D 都分不开(另一形态、气球跟本体一样是 2 / 0x50)。
-// 唯一干净的定义：units_by_type[1]/[2]/[236] 里每个单位的 unit.model + 0x20。
+// 唯一干净的定义：单位类型表里各键下每个单位的 unit.model + 0x20。
 //   - 魔术师分身是 CloneUnit，在独立的键 [17] 里，不在这张表里，自然排除
 //   - 幻灯师分身 SlideManCloneUnit 却在 [2] 里，靠 is_civilian_puppet == True 排除
 //     (它 is_clone=False、is_puppet=False，这两个名字都骗人，别用)
@@ -118,6 +120,10 @@ static int     g_另形缓存数 = 0;
 static int64_t g_i_unit_model = -1, g_i_cpuppet = -1;   // 表满时的共用缓存
 
 static volatile bool g_可用 = false;
+// 局外(大厅/准备阶段)：units_by_type 完整读出来了、而且没有键 1/2。
+// 准备阶段 cam.unit 是 MyCityUnit，它的 model+0x20 读不出场景指针(2026-09-22 实测)，锚点那步会失败，
+// 所以这个标志不挂在 快照/g_可用 上，在锚点之前单独算、单独发布。读不全一律算"不是局外"
+static volatile bool g_局外 = false;
 static volatile int  g_连续失败 = 0;
 static char g_状态[96] = "未启动";
 
@@ -245,6 +251,26 @@ static uint64_t 取分类表(uint64_t ubt, int 类型)
     return 0;
 }
 
+// 判断是不是局外。units_by_type 的每个键都要读成功才下结论 —— 取分类表() 返回 0 分不清
+// "没有这个键"和"键对象所在页读不到"，拿它判会在对局中途的读失败里误判成局外、把人全藏掉。
+// 局外 = 没有键 1(监管) 也没有键 2(求生者)。2026-09-22 准备阶段实测键只有 53/59/74/100/1009。
+static bool 判局外(uint64_t ubt, bool &局外)
+{
+    字典 k;
+    if (!取字典(ubt, k) || k.条数 <= 0) return false;
+    bool 有玩家 = false;
+    for (int64_t i = 0; i < k.条数; i++) {
+        uint64_t kp = getPtr64(键槽(k, i));
+        if (kp == 0) continue;                         // 已删除的条目
+        if (!是对象(kp) || getPtr64(kp + 8) != g_整数类型) return false;
+        int64_t sz = 0; uint32_t dg = 0;
+        if (!vm_readv(kp + 16, &sz, 8) || !vm_readv(kp + 24, &dg, 4)) return false;
+        if (sz == 1 && (dg == 1 || dg == 2)) 有玩家 = true;
+    }
+    局外 = !有玩家;
+    return true;
+}
+
 static bool 取列表(uint64_t L, int64_t &n, uint64_t &items)
 {
     if (!是对象(L)) return false;
@@ -330,10 +356,22 @@ static void 收单位(uint64_t ubt, int 类型, 快照 &出)
 
 static bool 尝试刷新()
 {
-    if (g_模块字典 == 0 && !解析模块()) return false;
+    if (g_模块字典 == 0 && !解析模块()) { g_局外 = false; return false; }
 
     快照 出;
     memset(&出, 0, sizeof(出));
+
+    // ---- 零、units_by_type + 局外判定(必须在锚点之前，见 g_局外) ----
+    g_i_unit_mgr = 查名(g_模块字典, "unit_mgr", g_i_unit_mgr);
+    uint64_t um = (g_i_unit_mgr >= 0) ? 取属性(g_模块字典, g_i_unit_mgr) : 0;
+    uint64_t ud = 取实例字典(um);
+    uint64_t ubt = 0;
+    if (ud) {
+        g_i_ubt = 查名(ud, "units_by_type", g_i_ubt);
+        ubt = (g_i_ubt >= 0) ? 取属性(ud, g_i_ubt) : 0;
+    }
+    bool 局外 = false;
+    g_局外 = 是对象(ubt) && 判局外(ubt, 局外) && 局外;
 
     // ---- 一、当前操控单位：g_cam_ctrl.unit ----
     g_i_cam = 查名(g_模块字典, "g_cam_ctrl", g_i_cam);
@@ -366,15 +404,8 @@ static bool 尝试刷新()
     if (出.锚点 == 0) { snprintf(g_状态, sizeof(g_状态), "cam.unit.model 读不到"); return false; }
 
     // ---- 二、废弃模型黑名单 + 本体集合 + 监管本体 ----
-    g_i_unit_mgr = 查名(g_模块字典, "unit_mgr", g_i_unit_mgr);
-    uint64_t um = (g_i_unit_mgr >= 0) ? 取属性(g_模块字典, g_i_unit_mgr) : 0;
-    uint64_t ud = 取实例字典(um);
-    if (ud) {
-        g_i_ubt = 查名(ud, "units_by_type", g_i_ubt);
-        uint64_t ubt = (g_i_ubt >= 0) ? 取属性(ud, g_i_ubt) : 0;
-        if (是对象(ubt))
-            for (int i = 0; i < 单位类型数; i++) 收单位(ubt, 单位类型表[i], 出);
-    }
+    if (是对象(ubt))
+        for (int i = 0; i < 单位类型数; i++) 收单位(ubt, 单位类型表[i], 出);
     // 这一段读不到不算失败：锚点已经拿到了。本体数为 0 时绘制侧会退回按类名画
 
     int 写 = 1 - g_活跃;
@@ -454,8 +485,12 @@ static bool 是废弃模型(uintptr_t obj)
     return false;
 }
 
+// 大厅/准备阶段：Python 侧还没有任何玩家单位，场景里的 chr/player、chr/boss 对象(时装挂件、头饰、袖子)
+// 全都没有宿主，绘制侧据此整类不画。读不全时是 false，照旧按类名画
+static inline bool 局外() { return g_局外; }
+
 // 本体集合能不能用。准备阶段/大厅里 units_by_type 没有 [1]/[2](实测两次)，这里就是 false，
-// 绘制侧据此退回按类名画 —— 所以它同时也是"是否在局内"的信号
+// 绘制侧据此退回按类名画(读取失败时同样是 false，所以"是否局外"要看 局外()，别用它)
 static inline bool 本体集合可用() { return g_可用 && g_缓冲[g_活跃].本体数 > 0; }
 
 static bool 是本体(uintptr_t obj)

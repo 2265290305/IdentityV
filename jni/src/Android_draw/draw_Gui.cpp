@@ -172,7 +172,7 @@ static bool show_demo_window = false;
 static bool show_another_window = false;
 static bool show_window = true;  // 音量键控制：音量下=隐藏，音量上=显示
 static bool voice = true;
-static bool inform_ghost = false; // 显示鬼魂
+static bool inform_ghost = true; // 显示鬼魂
 static bool show_sohook = false;  // 骨骼与进度覆盖层
 
 float z_x, z_y, z_z, d_x, d_y, d_z, camera, r_x, r_y, r_w;
@@ -471,6 +471,13 @@ inline bool should_filter(const std::string& name) {
 // ================== 幽灵/隐身状态判定(合并原有特殊场景排除) ==================
 // +0x70 == 0x1000000 且 +0x1a0 == 450.0 才是"正常在场"的真实角色/道具;
 // 其余取值(包括65150鬼魂视角等)统一视为幽灵态, 由 inform_ghost 决定是否仍然显示。
+// 方框配色也用这一个判据 —— 热更后鬼魂的 +0x70 不再是 65150, 只认 65150 会让鬼魂框不变白。
+bool IsGhostEntity(const DataStruct& obj) {
+    int checkVal = getDword(obj.obj + 0x70);
+    float checkFloat = getFloat(obj.obj + 0x1a0);
+    return (checkVal != 0x1000000 || checkFloat != 450.0f);
+}
+
 bool ShouldSkipEntity(const DataStruct& obj) {
     // 这几类名字命中即直接跳过, 与幽灵判定无关(原本散落在渲染循环里, 现在收拢到一处)
     if (strstr(obj.类名, "h55_joseph_camera") != NULL) return true;   // 约瑟夫相机
@@ -487,9 +494,7 @@ bool ShouldSkipEntity(const DataStruct& obj) {
     // 精确、跟视角无关、不用维护名单。详见 PySelf.h 文件头。
     if (本机::是废弃模型(obj.obj)) return true;
 
-    int checkVal = getDword(obj.obj + 0x70);
-    float checkFloat = getFloat(obj.obj + 0x1a0);
-    bool is_ghost_obj = (checkVal != 0x1000000 || checkFloat != 450.0f);
+    bool is_ghost_obj = IsGhostEntity(obj);
 
     // 注意 +0x70 就是 NeoX 模型对象的 visible, 是**渲染剔除的结果**:
     // 废弃模型恒不可见, 但远处的真实对象同样不可见。所以它只能当"要不要按幽灵显示"的开关,
@@ -1010,7 +1015,7 @@ void Draw_Main(ImDrawList *Draw){
 
             int 米 = (int)(sqrt(pow(mx - Z.X, 2) + pow(my - Z.Y, 2) + pow(mz - Z.Z, 2)) / 距离比例);
             char 文字[64];
-            if (门.开启中)      snprintf(文字, sizeof(文字), "[%.1f%%↑]", 门.进度);
+            if (门.开启中)      snprintf(文字, sizeof(文字), "[%.1f%%]", 门.进度);
             else                snprintf(文字, sizeof(文字), "[%.1f%%]",  门.进度);   // 不可开时按灰色画，见下
 
             // 有进度就在文字上方画一条，跟密码机那套一致
@@ -1043,11 +1048,15 @@ void Draw_Main(ImDrawList *Draw){
             continue; // 不管有效无效, 自身都不需要再走下面的常规实体流程
         }
 
-        // 只画角色本体：CPython 侧 units_by_type[1]/[2]/[236] 的 unit.model 对应的场景对象(见 PySelf.h 本体集合)。
+        // 只画角色本体：CPython 侧 units_by_type[1]/[2]/[236]/[1065] 的 unit.model 对应的场景对象(见 PySelf.h 本体集合)。
         // 挡掉同名分身副本(_fragrance_image)、另一形态、挂件、时装、魔术师/幻灯师分身；机械玩偶保留。
         // 只管按 player/boss 类名归进 1/2 的对象 —— 类名分类那里另有两个特例(deluosi 鬼魂、火箭挂件)
         // 被故意归成求生者，它们不是任何单位的 model，不能被这层挡掉。
         // 本体集合不可用(准备阶段/大厅/读取失败)时不过滤，照旧按类名画。
+        // 大厅/准备阶段(units_by_type 读全了且没有键 1/2)：没有任何玩家单位，场景里的人物对象全是
+        // 无宿主的时装挂件(头饰/袖子)，阵营 1/2 整类不画。预知监管在读取循环里算，不受影响
+        if ((data[i].阵营 == 1 || data[i].阵营 == 2) && 本机::局外())
+            continue;
         if ((data[i].阵营 == 1 || data[i].阵营 == 2) && 本机::本体集合可用()
             && (strstr(data[i].类名, "player") != NULL || strstr(data[i].类名, "boss") != NULL)
             && !本机::是本体(data[i].obj))
@@ -1271,7 +1280,7 @@ void Draw_Main(ImDrawList *Draw){
                     auto textSize = ImGui::CalcTextSize(s.c_str(), 0, 25);
                     Draw->AddText({X1 + W/2-(textSize.x/2),Y1-45}, ImColor(255,200,0,255), s.c_str());
                     if (show_draw_Rect){
-        			    if (jxpd==65150)
+        			    if (IsGhostEntity(data[i]))
         			        ImGui::GetForegroundDrawList()->AddRect({X1, Y1},{X2, Y2}, BotBoneColor,3, 0,1.8);			        	        
         			    else if (data[i].阵营==1)
         			        ImGui::GetForegroundDrawList()->AddRect({X1, Y1},{X2, Y2}, BoneColor,3, 0,1.8f);
@@ -1321,7 +1330,8 @@ void Draw_Main(ImDrawList *Draw){
                             }
                             // 监管再单独一行写当前辅助特质 + 剩余冷却
                             // (带底牌会局中换特质，所以读的是实时值；冷却来自 skill_mgr，见 PyGenius.h)
-                            if (gi.阵营 == 1 && gi.辅助特质 != 0){
+                            // 梦之信徒(236)只有这一行：每个信徒有自己独立的闪现等特质冷却
+                            if ((gi.阵营 == 1 || gi.阵营 == 天赋::YIDHRA_PUPPET_UNIT_TYPE) && gi.辅助特质 != 0){
                                 char 特质行[48];
                                 天赋::特质行文本(gi, 天赋::特质名(gi.辅助特质), 特质行, sizeof(特质行));
                                 if (特质行[0]){
