@@ -659,9 +659,18 @@ void read_thread(long int PD1,long int PD2,long int PD3)
     	    // 每轮仍读一次第一跳(obj+0xf8)，值对得上才用缓存。7 次读降到 1 次，又不会张冠李戴。
     	    // 校验不是绝对的(新对象的第一跳恰好相同就会漏网)，但那种情况下最多错一轮的标签，
     	    // 下一轮对象就稳定了；换来的是整轮耗时减半。
-    	    uint64_t chain_head = getPtr64(cur_obj + 0xf8);
+    	    //
+    	    // ★ 读失败时沿用缓存(2026-09-23)：内存压力下类名那条链要碰约 6 个堆页，
+    	    //   任何一个被换进 zram 就整条断掉、对象被丢弃 —— 这正是"实体数量整体塌陷"的成因。
+    	    //   而校验只碰对象自己那一页。所以这里必须分清"读失败"和"值就是 0"：
+    	    //   getPtr64 两种情况都返回 0(内部 T result{} 值初始化)，因此改用 vm_readv 拿返回值。
+    	    //   读失败 -> 沿用缓存里的类名，让对象继续画出来(坐标仍是实时读的，位置不会错)；
+    	    //   代价是万一该地址已换成别的对象，标签会是旧的 —— 比整个消失可接受。
+    	    uint64_t chain_head = 0;
+    	    bool head_ok = vm_readv(cur_obj + 0xf8, &chain_head, 8);
+    	    chain_head &= 0x00FFFFFFFFFFFFFFULL;
     	    auto nc = g_name_cache.find(cur_obj);
-    	    if (nc != g_name_cache.end() && nc->second.first == chain_head) {
+    	    if (nc != g_name_cache.end() && (!head_ok || nc->second.first == chain_head)) {
     	        filter_class_name = nc->second.second;
     	    } else {
     	        uint64_t class_name_obj = getPtr64(getPtr64(getPtr64(getPtr64(chain_head)+0x8)+0x20)+0x20)+0x0;
@@ -671,7 +680,8 @@ void read_thread(long int PD1,long int PD2,long int PD3)
     	        filter_class_name.resize(len);
     	        vm_readv(getPtr64(class_name_obj + 0x8), &filter_class_name[0], len);
     	        // 跨局会不断有新对象，攒太多就整体清一次，下一轮重建(只是多花一轮的读取)
-    	        if (g_name_cache.size() > 4000) g_name_cache.clear();
+    	        // 每条约 180 字节(map 节点 + 类名字符串)：对局中约 300 条≈50KB，1500 条≈250KB
+    	        if (g_name_cache.size() > 1500) g_name_cache.clear();
     	        g_name_cache[cur_obj] = std::make_pair(chain_head, filter_class_name);
     	    }
         		
@@ -800,7 +810,9 @@ void read_thread(long int PD1,long int PD2,long int PD3)
         mirror_preview_obj  = mirror_preview_local;
         if (prophet_local[0]) memcpy(prophet_text, prophet_local, sizeof(prophet_text));
         data_count = entity_count;
-        sleep(3);
+        // 2026-09-23：3 秒 -> 2 秒。一轮实测约 9ms，读线程 CPU 0.3% -> 0.45%，
+        // data[] 的撕裂窗口同比例从 0.3% 到 0.45%，都可忽略；换来新对象和预知监管更快出现
+        sleep(2);
     }
 }
 
