@@ -1,17 +1,57 @@
 #include <cstdlib>
+#include <cstring>
 #include <dlfcn.h>
 #include "VulkanGraphics.h"
 #include "imgui_impl_vulkan.h"
 #include <vulkan/vulkan_android.h>
 #include <android/native_window.h>
+#include <android/log.h>
 #include <unistd.h>
+
+#define VK_LOG_TAG "IdentityV-Vulkan"
+#define VK_LOGI(...) __android_log_print(ANDROID_LOG_INFO, VK_LOG_TAG, __VA_ARGS__)
+#define VK_LOGE(...) __android_log_print(ANDROID_LOG_ERROR, VK_LOG_TAG, __VA_ARGS__)
+
+static const char *vk_result_name(VkResult result) {
+    switch (result) {
+        case VK_SUCCESS: return "VK_SUCCESS";
+        case VK_NOT_READY: return "VK_NOT_READY";
+        case VK_TIMEOUT: return "VK_TIMEOUT";
+        case VK_EVENT_SET: return "VK_EVENT_SET";
+        case VK_EVENT_RESET: return "VK_EVENT_RESET";
+        case VK_INCOMPLETE: return "VK_INCOMPLETE";
+        case VK_ERROR_OUT_OF_HOST_MEMORY: return "VK_ERROR_OUT_OF_HOST_MEMORY";
+        case VK_ERROR_OUT_OF_DEVICE_MEMORY: return "VK_ERROR_OUT_OF_DEVICE_MEMORY";
+        case VK_ERROR_INITIALIZATION_FAILED: return "VK_ERROR_INITIALIZATION_FAILED";
+        case VK_ERROR_DEVICE_LOST: return "VK_ERROR_DEVICE_LOST";
+        case VK_ERROR_MEMORY_MAP_FAILED: return "VK_ERROR_MEMORY_MAP_FAILED";
+        case VK_ERROR_LAYER_NOT_PRESENT: return "VK_ERROR_LAYER_NOT_PRESENT";
+        case VK_ERROR_EXTENSION_NOT_PRESENT: return "VK_ERROR_EXTENSION_NOT_PRESENT";
+        case VK_ERROR_FEATURE_NOT_PRESENT: return "VK_ERROR_FEATURE_NOT_PRESENT";
+        case VK_ERROR_INCOMPATIBLE_DRIVER: return "VK_ERROR_INCOMPATIBLE_DRIVER";
+        case VK_ERROR_TOO_MANY_OBJECTS: return "VK_ERROR_TOO_MANY_OBJECTS";
+        case VK_ERROR_FORMAT_NOT_SUPPORTED: return "VK_ERROR_FORMAT_NOT_SUPPORTED";
+        case VK_ERROR_SURFACE_LOST_KHR: return "VK_ERROR_SURFACE_LOST_KHR";
+        case VK_ERROR_NATIVE_WINDOW_IN_USE_KHR: return "VK_ERROR_NATIVE_WINDOW_IN_USE_KHR";
+        case VK_ERROR_OUT_OF_DATE_KHR: return "VK_ERROR_OUT_OF_DATE_KHR";
+        default: return "VK_UNKNOWN";
+    }
+}
+
+static bool has_device_extension(const ImVector<VkExtensionProperties> &extensions, const char *extension_name) {
+    for (int i = 0; i < extensions.Size; ++i) {
+        if (strcmp(extensions[i].extensionName, extension_name) == 0)
+            return true;
+    }
+    return false;
+}
 
 #ifndef NDEBUG
 
 static void check_vk_result(VkResult err) {
     if (err == 0)
         return;
-    fprintf(stderr, "[vulkan] Error: VkResult = %d\n", err);
+    VK_LOGE("Vulkan error: %s (%d)", vk_result_name(err), err);
     if (err < 0)
         abort();
 }
@@ -25,15 +65,25 @@ static void check_vk_result(VkResult err) {
 #endif
 
 VkPhysicalDevice VulkanGraphics::SetupVulkan_SelectPhysicalDevice() {
-    uint32_t gpu_count;
+    VK_LOGI("Enumerating Vulkan physical devices");
+    uint32_t gpu_count = 0;
     VkResult err = vkEnumeratePhysicalDevices(m_Instance, &gpu_count, nullptr);
+    VK_LOGI("vkEnumeratePhysicalDevices(count): %s (%d), count=%u",
+            vk_result_name(err), err, gpu_count);
     check_vk_result(err);
-    IM_ASSERT(gpu_count > 0);
+    if (err != VK_SUCCESS || gpu_count == 0) {
+        VK_LOGE("No Vulkan physical device found");
+        return VK_NULL_HANDLE;
+    }
 
     ImVector<VkPhysicalDevice> gpus;
     gpus.resize(gpu_count);
     err = vkEnumeratePhysicalDevices(m_Instance, &gpu_count, gpus.Data);
+    VK_LOGI("vkEnumeratePhysicalDevices(list): %s (%d), count=%u",
+            vk_result_name(err), err, gpu_count);
     check_vk_result(err);
+    if (err != VK_SUCCESS)
+        return VK_NULL_HANDLE;
 
     // If a number >1 of GPUs got reported, find discrete GPU if present, or use first one available. This covers
     // most common cases (multi-gpu/integrated+dedicated graphics). Handling more complicated setups (multiple
@@ -41,6 +91,14 @@ VkPhysicalDevice VulkanGraphics::SetupVulkan_SelectPhysicalDevice() {
     for (VkPhysicalDevice &device: gpus) {
         VkPhysicalDeviceProperties properties;
         vkGetPhysicalDeviceProperties(device, &properties);
+        VK_LOGI("GPU: %s, vendor=0x%x, device=0x%x, api=%u.%u.%u, type=%d",
+                properties.deviceName,
+                properties.vendorID,
+                properties.deviceID,
+                VK_VERSION_MAJOR(properties.apiVersion),
+                VK_VERSION_MINOR(properties.apiVersion),
+                VK_VERSION_PATCH(properties.apiVersion),
+                properties.deviceType);
         if (properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU)
             return device;
     }
@@ -52,18 +110,51 @@ VkPhysicalDevice VulkanGraphics::SetupVulkan_SelectPhysicalDevice() {
 }
 
 bool VulkanGraphics::Create() {
+    VK_LOGI("Vulkan Create begin: window=%p, size=%dx%d",
+            m_Window, (int)m_Width, (int)m_Height);
+
     if (InitVulkan() != 1) {
-        fprintf(stderr, "Vulkan is not supported %s\n", dlerror());
+        const char *error = dlerror();
+        VK_LOGE("InitVulkan failed: %s", error != nullptr ? error : "unknown error");
         abort();
+    }
+    VK_LOGI("InitVulkan succeeded: vkCreateInstance=%p, vkGetInstanceProcAddr=%p, "
+            "vkEnumeratePhysicalDevices=%p, vkCreateDevice=%p, vkCreateAndroidSurfaceKHR=%p",
+            (void *)vkCreateInstance,
+            (void *)vkGetInstanceProcAddr,
+            (void *)vkEnumeratePhysicalDevices,
+            (void *)vkCreateDevice,
+            (void *)vkCreateAndroidSurfaceKHR);
+
+    if (vkCreateInstance == nullptr ||
+        vkGetInstanceProcAddr == nullptr ||
+        vkEnumeratePhysicalDevices == nullptr ||
+        vkCreateDevice == nullptr ||
+        vkCreateAndroidSurfaceKHR == nullptr) {
+        VK_LOGE("Required Vulkan function pointer is null");
+        return false;
     }
 
     wd = std::make_unique<ImGui_ImplVulkanH_Window>();
 
     //为imgui加载vulkan函数
     void *libvulkan = dlopen("libvulkan.so", RTLD_NOW);
-    ImGui_ImplVulkan_LoadFunctions([](const char *function_name, void *handle) -> PFN_vkVoidFunction {
+    const char *loader_error = dlerror();
+    VK_LOGI("ImGui Vulkan loader library=%p, error=%s",
+            libvulkan, loader_error != nullptr ? loader_error : "none");
+    if (libvulkan == nullptr) {
+        VK_LOGE("Cannot load libvulkan.so");
+        return false;
+    }
+    bool imgui_functions_loaded = ImGui_ImplVulkan_LoadFunctions([](const char *function_name, void *handle) -> PFN_vkVoidFunction {
         return reinterpret_cast<PFN_vkVoidFunction>(dlsym(handle, function_name));
     }, libvulkan);
+    VK_LOGI("ImGui Vulkan function loading finished: %s",
+            imgui_functions_loaded ? "success" : "failed");
+    if (!imgui_functions_loaded) {
+        VK_LOGE("ImGui Vulkan function loading failed; aborting Vulkan setup");
+        return false;
+    }
 
     VkResult err;
     // Create Vulkan Instance
@@ -79,13 +170,15 @@ bool VulkanGraphics::Create() {
                 .applicationVersion = VK_MAKE_VERSION(1, 0, 0),
                 .pEngineName = "pEngineName",
                 .engineVersion = VK_MAKE_VERSION(1, 0, 0),
-                .apiVersion = VK_MAKE_VERSION(1, 1, 0),
+                .apiVersion = VK_MAKE_VERSION(1, 0, 0),
         };
         VkInstanceCreateInfo create_info = {};
         create_info.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
         create_info.pApplicationInfo = &appInfo;
         create_info.enabledExtensionCount = sizeof(instance_extensions) / sizeof(instance_extensions[0]);
         create_info.ppEnabledExtensionNames = instance_extensions;
+        VK_LOGI("Creating Vulkan instance: api=1.0, extensions=%u",
+                create_info.enabledExtensionCount);
 #ifdef IMGUI_VULKAN_DEBUG_REPORT
         // Enabling validation layers
             const char* layers[] = { "VK_LAYER_KHRONOS_validation" };
@@ -119,27 +212,74 @@ bool VulkanGraphics::Create() {
 #else
         // Create Vulkan Instance without any debug feature
         err = vkCreateInstance(&create_info, m_Allocator, &m_Instance);
+        VK_LOGI("vkCreateInstance: %s (%d), instance=%p",
+                vk_result_name(err), err, (void *)m_Instance);
         check_vk_result(err);
         IM_UNUSED(m_DebugReport);
 #endif
     }
+    if (m_Instance == VK_NULL_HANDLE) {
+        VK_LOGE("Vulkan instance is null after vkCreateInstance");
+        return false;
+    }
+
+    // Android's Vulkan loader may expose extension commands only through
+    // vkGetInstanceProcAddr, not as symbols returned by dlsym().
+#define LOAD_INSTANCE_FUNCTION(function_name) \
+    do { \
+        function_name = reinterpret_cast<PFN_##function_name>( \
+                vkGetInstanceProcAddr(m_Instance, #function_name)); \
+        VK_LOGI("Instance function %s=%p", #function_name, (void *)function_name); \
+        if (function_name == nullptr) { \
+            VK_LOGE("Missing required instance function: %s", #function_name); \
+            return false; \
+        } \
+    } while (0)
+    LOAD_INSTANCE_FUNCTION(vkDestroyInstance);
+    LOAD_INSTANCE_FUNCTION(vkEnumeratePhysicalDevices);
+    LOAD_INSTANCE_FUNCTION(vkGetPhysicalDeviceProperties);
+    LOAD_INSTANCE_FUNCTION(vkGetPhysicalDeviceQueueFamilyProperties);
+    LOAD_INSTANCE_FUNCTION(vkEnumerateDeviceExtensionProperties);
+    LOAD_INSTANCE_FUNCTION(vkCreateDevice);
+    LOAD_INSTANCE_FUNCTION(vkCreateAndroidSurfaceKHR);
+    LOAD_INSTANCE_FUNCTION(vkGetPhysicalDeviceSurfaceSupportKHR);
+    LOAD_INSTANCE_FUNCTION(vkGetPhysicalDeviceSurfaceCapabilitiesKHR);
+    LOAD_INSTANCE_FUNCTION(vkGetPhysicalDeviceSurfaceFormatsKHR);
+    LOAD_INSTANCE_FUNCTION(vkGetPhysicalDeviceSurfacePresentModesKHR);
+#undef LOAD_INSTANCE_FUNCTION
 
     // Select Physical Device (GPU)
     m_PhysicalDevice = SetupVulkan_SelectPhysicalDevice();
+    if (m_PhysicalDevice == VK_NULL_HANDLE) {
+        VK_LOGE("Physical device selection failed");
+        return false;
+    }
 
     // Select graphics queue family
     {
-        uint32_t count;
+        uint32_t count = 0;
         vkGetPhysicalDeviceQueueFamilyProperties(m_PhysicalDevice, &count, nullptr);
+        VK_LOGI("Queue family count=%u", count);
+        if (count == 0) {
+            VK_LOGE("No Vulkan queue family found");
+            return false;
+        }
         VkQueueFamilyProperties *queues = (VkQueueFamilyProperties *) malloc(sizeof(VkQueueFamilyProperties) * count);
         vkGetPhysicalDeviceQueueFamilyProperties(m_PhysicalDevice, &count, queues);
-        for (uint32_t i = 0; i < count; i++)
+        for (uint32_t i = 0; i < count; i++) {
+            VK_LOGI("Queue family[%u]: flags=0x%x, queues=%u",
+                    i, queues[i].queueFlags, queues[i].queueCount);
             if (queues[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) {
                 m_QueueFamily = i;
                 break;
             }
+        }
         free(queues);
-        IM_ASSERT(m_QueueFamily != (uint32_t) -1);
+        if (m_QueueFamily == (uint32_t) -1) {
+            VK_LOGE("No graphics queue family found");
+            return false;
+        }
+        VK_LOGI("Selected graphics queue family=%u", m_QueueFamily);
     }
 
     // Create Logical Device (with 1 queue)
@@ -148,13 +288,26 @@ bool VulkanGraphics::Create() {
         device_extensions.push_back("VK_KHR_swapchain");
 
         // Enumerate physical device extension
-        uint32_t properties_count;
+        uint32_t properties_count = 0;
         ImVector<VkExtensionProperties> properties;
-        vkEnumerateDeviceExtensionProperties(m_PhysicalDevice, nullptr, &properties_count, nullptr);
+        err = vkEnumerateDeviceExtensionProperties(m_PhysicalDevice, nullptr, &properties_count, nullptr);
+        VK_LOGI("Device extension count: %s (%d), count=%u",
+                vk_result_name(err), err, properties_count);
+        if (err != VK_SUCCESS)
+            return false;
         properties.resize(properties_count);
-        vkEnumerateDeviceExtensionProperties(m_PhysicalDevice, nullptr, &properties_count, properties.Data);
+        err = vkEnumerateDeviceExtensionProperties(m_PhysicalDevice, nullptr, &properties_count, properties.Data);
+        VK_LOGI("Device extension list: %s (%d)", vk_result_name(err), err);
+        if (err != VK_SUCCESS)
+            return false;
+        bool has_swapchain = has_device_extension(properties, "VK_KHR_swapchain");
+        VK_LOGI("VK_KHR_swapchain available=%s", has_swapchain ? "yes" : "no");
+        if (!has_swapchain) {
+            VK_LOGE("Required device extension VK_KHR_swapchain is missing");
+            return false;
+        }
 #ifdef VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME
-        if (IsExtensionAvailable(properties, VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME))
+        if (has_device_extension(properties, VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME))
             device_extensions.push_back(VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME);
 #endif
 
@@ -171,8 +324,35 @@ bool VulkanGraphics::Create() {
         create_info.enabledExtensionCount = (uint32_t) device_extensions.Size;
         create_info.ppEnabledExtensionNames = device_extensions.Data;
         err = vkCreateDevice(m_PhysicalDevice, &create_info, m_Allocator, &m_Device);
+        VK_LOGI("vkCreateDevice: %s (%d), device=%p",
+                vk_result_name(err), err, (void *)m_Device);
         check_vk_result(err);
+        if (err != VK_SUCCESS || m_Device == VK_NULL_HANDLE)
+            return false;
         vkGetDeviceQueue(m_Device, m_QueueFamily, 0, &m_Queue);
+        VK_LOGI("vkGetDeviceQueue: queue=%p", (void *)m_Queue);
+        if (m_Queue == VK_NULL_HANDLE) {
+            VK_LOGE("vkGetDeviceQueue returned a null queue");
+            return false;
+        }
+
+        // Load device-level WSI functions from the device dispatch table.
+#define LOAD_DEVICE_FUNCTION(function_name) \
+    do { \
+        function_name = reinterpret_cast<PFN_##function_name>( \
+                vkGetDeviceProcAddr(m_Device, #function_name)); \
+        VK_LOGI("Device function %s=%p", #function_name, (void *)function_name); \
+        if (function_name == nullptr) { \
+            VK_LOGE("Missing required device function: %s", #function_name); \
+            return false; \
+        } \
+    } while (0)
+        LOAD_DEVICE_FUNCTION(vkCreateSwapchainKHR);
+        LOAD_DEVICE_FUNCTION(vkDestroySwapchainKHR);
+        LOAD_DEVICE_FUNCTION(vkGetSwapchainImagesKHR);
+        LOAD_DEVICE_FUNCTION(vkAcquireNextImageKHR);
+        LOAD_DEVICE_FUNCTION(vkQueuePresentKHR);
+#undef LOAD_DEVICE_FUNCTION
     }
     // Create Descriptor Pool
     {
@@ -197,7 +377,11 @@ bool VulkanGraphics::Create() {
         pool_info.poolSizeCount = (uint32_t) IM_ARRAYSIZE(pool_sizes);
         pool_info.pPoolSizes = pool_sizes;
         err = vkCreateDescriptorPool(m_Device, &pool_info, m_Allocator, &m_DescriptorPool);
+        VK_LOGI("vkCreateDescriptorPool: %s (%d), pool=%p",
+                vk_result_name(err), err, (void *)m_DescriptorPool);
         check_vk_result(err);
+        if (err != VK_SUCCESS || m_DescriptorPool == VK_NULL_HANDLE)
+            return false;
     }
     {
         // Create Window Surface
@@ -210,15 +394,23 @@ bool VulkanGraphics::Create() {
 
         err = vkCreateAndroidSurfaceKHR(m_Instance, &createInfo, m_Allocator,
                                         &surface);
+        VK_LOGI("vkCreateAndroidSurfaceKHR: %s (%d), surface=%p",
+                vk_result_name(err), err, (void *)surface);
         check_vk_result(err);
+        if (err != VK_SUCCESS || surface == VK_NULL_HANDLE)
+            return false;
         wd->Surface = surface;
 
         // Check for WSI support
-        VkBool32 res;
-        vkGetPhysicalDeviceSurfaceSupportKHR(m_PhysicalDevice, m_QueueFamily, wd->Surface, &res);
+        VkBool32 res = VK_FALSE;
+        err = vkGetPhysicalDeviceSurfaceSupportKHR(m_PhysicalDevice, m_QueueFamily, wd->Surface, &res);
+        VK_LOGI("Surface support: %s (%d), supported=%s",
+                vk_result_name(err), err, res == VK_TRUE ? "yes" : "no");
+        if (err != VK_SUCCESS)
+            return false;
         if (res != VK_TRUE) {
-            fprintf(stderr, "Error no WSI support on physical device 0\n");
-            exit(-1);
+            VK_LOGE("No WSI support for selected queue family");
+            return false;
         }
         // Select Surface Format
         const VkFormat requestSurfaceImageFormat[] = {VK_FORMAT_B8G8R8A8_UNORM, VK_FORMAT_R8G8B8A8_UNORM,
@@ -228,6 +420,8 @@ bool VulkanGraphics::Create() {
                                                                   requestSurfaceImageFormat,
                                                                   (size_t) IM_ARRAYSIZE(requestSurfaceImageFormat),
                                                                   requestSurfaceColorSpace);
+        VK_LOGI("Selected surface format=%d, color space=%d",
+                wd->SurfaceFormat.format, wd->SurfaceFormat.colorSpace);
 
         // Select Present Mode
 #ifdef APP_USE_UNLIMITED_FRAME_RATE
@@ -237,19 +431,31 @@ bool VulkanGraphics::Create() {
 #endif
         wd->PresentMode = ImGui_ImplVulkanH_SelectPresentMode(m_PhysicalDevice, wd->Surface, &present_modes[0],
                                                               IM_ARRAYSIZE(present_modes));
-        //printf("[vulkan] Selected PresentMode = %d\n", wd->PresentMode);
+        VK_LOGI("Selected present mode=%d", wd->PresentMode);
 
         // Create SwapChain, RenderPass, Framebuffer, etc.
-        IM_ASSERT(m_MinImageCount >= 2);
+        VK_LOGI("Creating Vulkan window resources");
         ImGui_ImplVulkanH_CreateOrResizeWindow(m_Instance, m_PhysicalDevice, m_Device, wd.get(), m_QueueFamily,
                                                m_Allocator,
                                                (int) m_Width, (int) m_Height, m_MinImageCount);
+        VK_LOGI("Window resources created: swapchain=%p, render_pass=%p, image_count=%u, size=%ux%u",
+                (void *)wd->Swapchain, (void *)wd->RenderPass, wd->ImageCount, wd->Width, wd->Height);
+
+        // 换链没建出来时必须向上报失败，否则主循环会一直空转、屏幕上看不到任何东西
+        // （上层可以据此回退到 OpenGL ES）。
+        if (wd->Swapchain == VK_NULL_HANDLE || wd->RenderPass == VK_NULL_HANDLE) {
+            VK_LOGE("Swapchain/render pass creation failed, Vulkan backend unusable");
+            return false;
+        }
     }
 
+    VK_LOGI("Vulkan Create completed");
     return true;
 }
 
 void VulkanGraphics::Setup() {
+    VK_LOGI("ImGui Vulkan Setup begin: instance=%p device=%p render_pass=%p",
+            (void *)m_Instance, (void *)m_Device, (void *)wd->RenderPass);
     ImGui_ImplVulkan_InitInfo init_info = {};
     init_info.Instance = m_Instance;
     init_info.PhysicalDevice = m_PhysicalDevice;
@@ -265,7 +471,8 @@ void VulkanGraphics::Setup() {
     init_info.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
     init_info.Allocator = m_Allocator;
     init_info.CheckVkResultFn = check_vk_result;
-    ImGui_ImplVulkan_Init(&init_info);
+    bool initialized = ImGui_ImplVulkan_Init(&init_info);
+    VK_LOGI("ImGui_ImplVulkan_Init returned=%s", initialized ? "true" : "false");
 }
 
 void VulkanGraphics::PrepareFrame(bool resize) {
@@ -296,10 +503,21 @@ void VulkanGraphics::PrepareFrame(bool resize) {
 void VulkanGraphics::Render(ImDrawData *drawData) {
     VkResult err;
 
+    if (wd == nullptr || m_Device == VK_NULL_HANDLE ||
+        m_Queue == VK_NULL_HANDLE || wd->Swapchain == VK_NULL_HANDLE ||
+        wd->SemaphoreCount == 0 || wd->FrameSemaphores == nullptr) {
+        VK_LOGE("Render skipped: invalid Vulkan state wd=%p device=%p queue=%p swapchain=%p",
+                (void *)wd.get(), (void *)m_Device, (void *)m_Queue,
+                wd != nullptr ? (void *)wd->Swapchain : nullptr);
+        return;
+    }
+
     VkSemaphore image_acquired_semaphore = wd->FrameSemaphores[wd->SemaphoreIndex].ImageAcquiredSemaphore;
     VkSemaphore render_complete_semaphore = wd->FrameSemaphores[wd->SemaphoreIndex].RenderCompleteSemaphore;
     err = vkAcquireNextImageKHR(m_Device, wd->Swapchain, UINT64_MAX, image_acquired_semaphore, VK_NULL_HANDLE,
                                 &wd->FrameIndex);
+    if (err != VK_SUCCESS && err != VK_SUBOPTIMAL_KHR)
+        VK_LOGE("vkAcquireNextImageKHR: %s (%d)", vk_result_name(err), err);
     if (err == VK_ERROR_OUT_OF_DATE_KHR /*|| err == VK_SUBOPTIMAL_KHR*/) {
         m_SwapChainRebuild = true;
         return;
@@ -373,6 +591,8 @@ void VulkanGraphics::Render(ImDrawData *drawData) {
         info.pSwapchains = &wd->Swapchain;
         info.pImageIndices = &wd->FrameIndex;
         VkResult err = vkQueuePresentKHR(m_Queue, &info);
+        if (err != VK_SUCCESS && err != VK_SUBOPTIMAL_KHR)
+            VK_LOGE("vkQueuePresentKHR: %s (%d)", vk_result_name(err), err);
         if (err == VK_ERROR_OUT_OF_DATE_KHR /*|| err == VK_SUBOPTIMAL_KHR*/) {
             m_SwapChainRebuild = true;
             return;
@@ -618,4 +838,3 @@ void VulkanGraphics::RemoveTexture(BaseTexData *tex) {
     ImGui_ImplVulkan_RemoveTexture((VkDescriptorSet) tex_data->DS);
     delete tex_data;
 }
-
