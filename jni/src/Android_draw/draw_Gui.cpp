@@ -13,18 +13,20 @@
 #include <linux/input.h>
 #include <sstream>
 #include <iomanip>
-std::string 过滤类名,类名;
+std::string filter_class_name,class_name;
+// 类名缓存：对象地址 -> {第一跳指针(校验用), 类名}。只有读线程碰它，不用加锁。见读取循环里的说明
+static std::unordered_map<uintptr_t, std::pair<uint64_t, std::string>> g_name_cache;
 char gwd1[25];
 char gwd2[25];
-float 距离比例=11.886;
-float 红夫人X, 红夫人Y, 红夫人Z;
-float 红夫人镜像X, 红夫人镜像Y, 红夫人镜像Z;
+float dist_scale=11.886;
+float redqueen_x, redqueen_y, redqueen_z;
+float redqueen_mirror_x, redqueen_mirror_y, redqueen_mirror_z;
 typedef struct {
     uintptr_t obj;
     uintptr_t objcoor;
-    int 阵营;
+    int camp;
     char str[256];//翻译名
-    char 类名[256];//类名
+    char class_name[256];//类名
 }DataStruct;
 DataStruct data[1000];
 
@@ -43,11 +45,11 @@ int native_window_screen_x, native_window_screen_y;
 std::unique_ptr<AndroidImgui>  graphics;
 ImFont* zh_font = NULL;
 bool niexi;
-float 矩阵视野距离;
-float 孽蜥距离,孽蜥按住距离;
+float cam_dist;
+float niexi_dist,niexi_hold_dist;
 /*定义*/
 bool DrawIo[50];
-float 孽蜥触摸X,孽蜥触摸Y;
+float niexi_touch_x,niexi_touch_y;
 bool M_Android_LoadFont(float SizePixels) {
     ImGuiIO &io = ImGui::GetIO();
     
@@ -141,11 +143,11 @@ void calculate_line_reflection(float x1, float y1, float x2, float y2, float xs,
 
 uintptr_t libbase;
 uintptr_t Arrayaddr, Count, Matrix;
-uintptr_t 对象,对象阵营,自身,自身阵营,namezfcz,namezfc;
-uintptr_t 红夫人,红夫人镜像,镜子,捏镜子,镜子预览;
-float 镜线X1, 镜线Y1, 镜线X2, 镜线Y2;   // 本帧镜面在水平面上的直线(两点)，mirror==true 时有效
-int 数量,zfcz,zfc;
-float 过滤矩阵[17];
+uintptr_t cur_obj,cur_obj_camp,self_obj,self_camp,namezfcz,namezfc;
+uintptr_t redqueen_obj,redqueen_mirror_obj,mirror_obj,held_mirror_obj,mirror_preview_obj;
+float mirror_line_x1, mirror_line_y1, mirror_line_x2, mirror_line_y2;   // 本帧镜面在水平面上的直线(两点)，mirror==true 时有效
+int data_count,zfcz,zfc;
+float filter_matrix[17];
 float matrix[16];
 float angle;
 
@@ -177,12 +179,12 @@ static bool show_sohook = false;  // 骨骼与进度覆盖层
 
 float z_x, z_y, z_z, d_x, d_y, d_z, camera, r_x, r_y, r_w;
 float X1,Y1,X2,Y2,W,H,MIDDLE,TOP,BOTTOM;
-int 距离;	
+int dist;	
 char objtext[256];
 //char content[1024];
 char Team[1024];
 char Name[1024];
-char 监管者预知[1024];
+char prophet_text[1024];
 
 float px,py;
 Vector3A D,Z,M;
@@ -190,7 +192,7 @@ Vector3A D,Z,M;
 
 void AimBotAuto()
 {   
-    bool 触摸状态 = false;
+    bool touching = false;
     // 是否按下触摸
 
 
@@ -252,11 +254,11 @@ void AimBotAuto()
     触摸状态 = false;
     usleep(1000*100);
     }*/
-    Touch::Down(孽蜥触摸X,孽蜥触摸Y);
+    Touch::Down(niexi_touch_x,niexi_touch_y);
     usleep(1000*10);
     for (int i = 0; i < 50; i++)
     {
-    Touch::Move(孽蜥触摸X+i*5,孽蜥触摸Y+i*5);
+    Touch::Move(niexi_touch_x+i*5,niexi_touch_y+i*5);
     usleep(1000*10);
     }
     //usleep(1000*10);
@@ -266,19 +268,19 @@ void AimBotAuto()
     usleep(1000*100);
     }
 }
-ImColor 红色 = ImColor(255,0,0,255);
-ImColor 绿色 = ImColor(0,255,0,255);
-ImColor 蓝色 = ImColor(0,0,255,255);
-ImColor 黄色 = ImColor(255,255,0,255);
-ImColor 紫色 = ImColor(255,0,255,255);
-ImColor 黑色 = ImColor(0,0,0,255);
+ImColor color_red = ImColor(255,0,0,255);
+ImColor color_green = ImColor(0,255,0,255);
+ImColor color_blue = ImColor(0,0,255,255);
+ImColor color_yellow = ImColor(255,255,0,255);
+ImColor color_purple = ImColor(255,0,255,255);
+ImColor color_black = ImColor(0,0,0,255);
 ImColor BoneColor = ImColor(255,0,0,255);
 ImColor BotBoneColor = ImColor(255,255,255,255);
-int 状态 = 0;
-int 数据获取状态 = 0;
-int 遍历次数=0;
-bool 首帧打印 = false;
-bool 首帧矩阵 = false;
+int read_state = 0;
+int fetch_state = 0;
+int iter_count=0;
+bool first_frame_logged = false;
+bool first_matrix_logged = false;
 char extractedString[64];
 long int MatrixOffset = 0,ArrayaddrOffset = 0;
 typedef struct {
@@ -480,19 +482,19 @@ bool IsGhostEntity(const DataStruct& obj) {
 
 bool ShouldSkipEntity(const DataStruct& obj) {
     // 这几类名字命中即直接跳过, 与幽灵判定无关(原本散落在渲染循环里, 现在收拢到一处)
-    if (strstr(obj.类名, "h55_joseph_camera") != NULL) return true;   // 约瑟夫相机
-    if (strstr(obj.类名, "redqueen_mirror") != NULL) return true;      // 红夫人镜子
-    if (strstr(obj.类名, "burke_console") != NULL) return true;        // 疯眼场景
-    if (strstr(obj.类名, "chr\\guajian") != NULL) return true;
-    if (strstr(obj.类名, "girl_e_sj_zuoyi") != NULL) return true;
-    if (strstr(obj.类名, "h55_survivor_w_shangren_tiaoban") != NULL) return true; // 商人跳板
+    if (strstr(obj.class_name, "h55_joseph_camera") != NULL) return true;   // 约瑟夫相机
+    if (strstr(obj.class_name, "redqueen_mirror") != NULL) return true;      // 红夫人镜子
+    if (strstr(obj.class_name, "burke_console") != NULL) return true;        // 疯眼场景
+    if (strstr(obj.class_name, "chr\\guajian") != NULL) return true;
+    if (strstr(obj.class_name, "girl_e_sj_zuoyi") != NULL) return true;
+    if (strstr(obj.class_name, "h55_survivor_w_shangren_tiaoban") != NULL) return true; // 商人跳板
 
     // 废弃模型(形态切换后留在数组里的旧形态)。这条取代了原来那份
     // "红蝶/无常/歌剧/破轮/木偶/冒险家" 的类名黑名单 —— 那份是按角色名猜的,
     // 漏一个角色就漏一个, 而且只在 inform_ghost 打开时才生效。
     // 现在直接问引擎: unit.another_model + 0x20 就是废弃形态的场景对象指针,
     // 精确、跟视角无关、不用维护名单。详见 PySelf.h 文件头。
-    if (本机::是废弃模型(obj.obj)) return true;
+    if (PySelf::is_stale_model(obj.obj)) return true;
 
     bool is_ghost_obj = IsGhostEntity(obj);
 
@@ -535,13 +537,13 @@ void read_thread(long int PD1,long int PD2,long int PD3)
             continue;
         }
         char line[1024];
-        bool 官方 = strstr(extractedString, "com.netease.idv") != NULL;
+        bool is_official = strstr(extractedString, "com.netease.idv") != NULL;
         while (fgets(line, sizeof(line), fp)){
             long a, t;
             if (sscanf(line, "%lx-%lx", &a, &t) != 2) continue;
             if (libbase == 0 && strstr(line, "r-xp")){
-                if (官方 && strstr(line, "."))    libbase = a;
-                if (!官方 && strstr(line, libso)) libbase = a;
+                if (is_official && strstr(line, "."))    libbase = a;
+                if (!is_official && strstr(line, libso)) libbase = a;
             }
         }
         fclose(fp);
@@ -569,21 +571,21 @@ void read_thread(long int PD1,long int PD2,long int PD3)
         	for (int ii=0;ii<512;ii+=1){
 
         	    if (MatrixOffset == 0 && *(long long*)(&buff[ii]) == 0x656A624F72655028LL){
-        	        uint64_t 签名地址 = result.addr + i*4096 + ii*8;
+        	        uint64_t sig_addr = result.addr + i*4096 + ii*8;
         	        // 2026-09-17 热更后 +0x430 恒为0。该处是一组步长0x88的指针，三个元素都能走到
         	        // 同一个矩阵对象，这次更新只是让它整体位移了0x10。写死任何一个下次还会废，
         	        // 改成在窗口内找"整条链都走得通"的槽位(p1有效 且 p1+0xa58 也有效)，自愈。
         	        // 注意上界：只判 >0x5000000000 会让浮点垃圾(如0x400674954293DF)也蒙混过关，
         	        // 本机用户态指针都在 0x77xx/0x79xx 段，统一卡 <0x8000000000。
         	        for (int off = 0x300; off <= 0x500; off += 8){
-        	            uint64_t 候选 = 签名地址 + off;
-        	            uint64_t p1 = getPtr64(候选);            // getPtr64 已做 0xB4 掩码
+        	            uint64_t cand_slot = sig_addr + off;
+        	            uint64_t p1 = getPtr64(cand_slot);            // getPtr64 已做 0xB4 掩码
         	            if (p1 <= 0x5000000000 || p1 >= 0x8000000000) continue;
         	            uint64_t p2 = getPtr64(p1 + 0xa58);
         	            if (p2 <= 0x5000000000 || p2 >= 0x8000000000) continue;
-        	            MatrixOffset = 候选 - libbase;
+        	            MatrixOffset = cand_slot - libbase;
         	            printf("[矩阵命中] 签名=0x%llX 槽位=+0x%X 根=0x%llX MatrixOffset=0x%lx\n",
-        	                   (unsigned long long)签名地址, off, (unsigned long long)候选, MatrixOffset);
+        	                   (unsigned long long)sig_addr, off, (unsigned long long)cand_slot, MatrixOffset);
         	            break;
         	        }
         	    }
@@ -606,19 +608,21 @@ void read_thread(long int PD1,long int PD2,long int PD3)
         }
         sleep(5);
     }
-    状态 = 2;
+    read_state = 2;
 
+    // CPython 根(sys.modules + 类型对象)：读 so 的 ELF 段表定位 .PyRuntime，三个 Py 模块共用
+    PyRoot::start(pid, libbase);
     // 密码机破译进度：走 CPython 对象图，自带后台线程(400ms 一轮)，跟这里的 3 秒大循环解耦
-    密码机进度::启动(libbase);
+    PyProgress::start(libbase);
     // 天赋与辅助特质：同一条 CPython 链路，独立线程 500ms 一轮(一局内基本不变，不用刷那么勤)
-    天赋::启动(libbase);
+    PyGenius::start(libbase);
     // 自身锚点(g_cam_ctrl.unit)与废弃模型黑名单：100ms 一轮，切换操控对象时要立刻跟上
-    本机::启动(libbase);
+    PySelf::start(libbase);
 
     Arrayaddr = getPtr64(libbase + ArrayaddrOffset);
     uint64_t ArrayEnd = getPtr64(libbase + ArrayaddrOffset + 8);
     Count = (ArrayEnd - Arrayaddr) / 8;
-    if (Count <= 0 || Count > 10000) Count = 3000;
+    if (Count <= 0 || Count > 10000) Count = 1000;   // 兜底值：实测对局中 Count 只有 274~307
     printf("[数组] Arrayaddr=0x%llX End=0x%llX Count=%d\n", (unsigned long long)Arrayaddr, (unsigned long long)ArrayEnd, (int)Count);
 
     while (true)
@@ -627,45 +631,61 @@ void read_thread(long int PD1,long int PD2,long int PD3)
         uint64_t curArrayEnd = getPtr64(libbase + ArrayaddrOffset + 8);
         uint64_t curCount = curArrayEnd > curArray ? (curArrayEnd - curArray) / 8 : 0;
 	    if (curArray < 0x5000000000 || curCount == 0 || curCount > 10000) {
-            数量 = 0;
-            状态 = 1;
+            data_count = 0;
+            read_state = 1;
             sleep(1);
             continue;
         }
         Arrayaddr = curArray;
         Count = curCount;
-        状态 = 2;
-    	int 指针数量=0;
-        红夫人 = 0;      // 每轮清零，防止跨局/跨帧残留
-        红夫人镜像 = 0;
-        镜子 = 0;
-        镜子预览 = 0;
-        for (int ii = 0; ii < Count && 指针数量 < 1000; ii++){
-            对象 = getPtr64(curArray+0x8 * ii);	// 遍历数量次数            
+        read_state = 2;
+    	int entity_count=0;
+        // 镜面这几个指针和预知文本先收在局部变量里，扫完一次性发布(见本轮末尾)。
+        // 原来是"每轮先把全局清零、扫描中途再赋值"，绘制线程撞进这段(约1ms)就会读到 0，
+        // 表现是红夫人模式下镜线约每分钟消失一帧。收在局部里，全局永远要么是上一轮的值、要么是新值。
+        // 清零的本意(防跨局残留)仍然保留：局部变量每轮从 0 开始，发布时整体覆盖。
+        uintptr_t rq_local = 0, rq_mirror_local = 0, mirror_local = 0, mirror_preview_local = 0;
+        char prophet_local[sizeof(prophet_text)];
+        prophet_local[0] = 0;
+        for (int ii = 0; ii < Count && entity_count < 1000; ii++){
+            cur_obj = getPtr64(curArray+0x8 * ii);	// 遍历数量次数            
                 
-    		if (对象 == 0)   			
+    		if (cur_obj == 0)   			
         		continue;    			    			
     		
-    	    uint64_t 类名对象 = getPtr64(getPtr64(getPtr64(getPtr64(getPtr64(对象 + 0xf8)+0x0)+0x8)+0x20)+0x20)+0x0;
-            int len = getDword(类名对象 + 0x10);
-            if (len >= 256 || len == 0 || len < 0)
-                continue;
-
-            过滤类名.resize(len);
-            vm_readv(getPtr64(类名对象 + 0x8), &过滤类名[0], len);
+    	    // 类名要走五跳指针再加长度和内容，共 7 次驱动读；一轮 300 个对象就是 2000 多次，
+    	    // 实测占了整轮 12ms 里的一半。同一个对象活着的时候类名不会变，所以按地址缓存。
+    	    // ⚠ 地址会被复用(对象释放后新对象可能落在同一地址)，所以缓存**必须带校验**：
+    	    // 每轮仍读一次第一跳(obj+0xf8)，值对得上才用缓存。7 次读降到 1 次，又不会张冠李戴。
+    	    // 校验不是绝对的(新对象的第一跳恰好相同就会漏网)，但那种情况下最多错一轮的标签，
+    	    // 下一轮对象就稳定了；换来的是整轮耗时减半。
+    	    uint64_t chain_head = getPtr64(cur_obj + 0xf8);
+    	    auto nc = g_name_cache.find(cur_obj);
+    	    if (nc != g_name_cache.end() && nc->second.first == chain_head) {
+    	        filter_class_name = nc->second.second;
+    	    } else {
+    	        uint64_t class_name_obj = getPtr64(getPtr64(getPtr64(getPtr64(chain_head)+0x8)+0x20)+0x20)+0x0;
+    	        int len = getDword(class_name_obj + 0x10);
+    	        if (len >= 256 || len == 0 || len < 0)
+    	            continue;
+    	        filter_class_name.resize(len);
+    	        vm_readv(getPtr64(class_name_obj + 0x8), &filter_class_name[0], len);
+    	        // 跨局会不断有新对象，攒太多就整体清一次，下一轮重建(只是多花一轮的读取)
+    	        if (g_name_cache.size() > 4000) g_name_cache.clear();
+    	        g_name_cache[cur_obj] = std::make_pair(chain_head, filter_class_name);
+    	    }
         		
-			int 过滤重复指针=0;
-			float pd1 = getFloat(对象 + 0x1a0);
-			float pd2 = getFloat(对象 + 0x298);
-			for (int i = 0; i < 指针数量; i++){
-        		if(对象 == data[i].obj){
-        		    过滤重复指针=1;
+			int is_dup=0;
+			float pd1 = getFloat(cur_obj + 0x1a0);   // 原来还读一次 +0x298(pd2)，没人用，已删
+			for (int i = 0; i < entity_count; i++){
+        		if(cur_obj == data[i].obj){
+        		    is_dup=1;
         		}        		    
         	}
-        	if (过滤重复指针 == 1){
+        	if (is_dup == 1){
     		    continue;
     		}
-        	if (should_filter(过滤类名)) {
+        	if (should_filter(filter_class_name)) {
         		continue;//过滤随从等无关对象
         	}
         	std::string s;
@@ -674,73 +694,73 @@ void read_thread(long int PD1,long int PD2,long int PD3)
             //   这样另一形态(无常黑白)、约瑟夫相机、大厅残留都不会顶掉真监管。
             // 准备阶段/大厅：units_by_type 里还没有监管单位(实测)，退回下面按类名匹配的老逻辑。
             //   ⚠ 准备阶段不能用 +0x73(visible) 过滤：打求生者时真监管的模型在准备界面是不可见的(实测)
-            uint64_t 真监管 = 0;
-            const bool 有真监管 = 本机::监管本体(真监管);
-            if (show_draw_prophet && 有真监管){
-                if (对象 == 真监管) sprintf(监管者预知, "%s", getboss(过滤类名.c_str()));
+            uint64_t real_hunter = 0;
+            const bool has_real_hunter = PySelf::hunter_body(real_hunter);
+            if (show_draw_prophet && has_real_hunter){
+                if (cur_obj == real_hunter) snprintf(prophet_local, sizeof(prophet_local), "%s", getboss(filter_class_name.c_str()));
             }
             else if (show_draw_prophet){//预知开始
-                if (strstr(过滤类名.c_str(), "burke_console") == NULL&&strstr(过滤类名.c_str(), "h55_joseph_camera") == NULL&&strstr(过滤类名.c_str(), "redqueen_e_heijin_yizi") == NULL&&strstr(过滤类名.c_str(), "_lod") == NULL){
-                    if (strstr(过滤类名.c_str(), "boss") != NULL){
-                        s += getboss(过滤类名.c_str());
-                        sprintf(监管者预知, "%s", s.c_str());
+                if (strstr(filter_class_name.c_str(), "burke_console") == NULL&&strstr(filter_class_name.c_str(), "h55_joseph_camera") == NULL&&strstr(filter_class_name.c_str(), "redqueen_e_heijin_yizi") == NULL&&strstr(filter_class_name.c_str(), "_lod") == NULL){
+                    if (strstr(filter_class_name.c_str(), "boss") != NULL){
+                        s += getboss(filter_class_name.c_str());
+                        snprintf(prophet_local, sizeof(prophet_local), "%s", s.c_str());
                     }       
                 }
             }//预知结束
     		
-			if (strstr(过滤类名.c_str(), "player") != NULL||strstr(过滤类名.c_str(), "boss") != NULL || pd1 == 450 || strstr(过滤类名.c_str(), "scene") != NULL || strstr(过滤类名.c_str(), "prop") != NULL || strstr(过滤类名.c_str(), "mirror") != NULL || Debugging )
+			if (strstr(filter_class_name.c_str(), "player") != NULL||strstr(filter_class_name.c_str(), "boss") != NULL || pd1 == 450 || strstr(filter_class_name.c_str(), "scene") != NULL || strstr(filter_class_name.c_str(), "prop") != NULL || strstr(filter_class_name.c_str(), "mirror") != NULL || Debugging )
 			{
-    			data[指针数量].obj = 对象;
+    			data[entity_count].obj = cur_obj;
     			// 阵营/str 必须先清零：下面那串 if-else 只有五个分支，而入口条件里的
     			// `pd1 == 450` 和 `Debugging` 能让对象进来却一个分支都不命中。
     			// data[] 是全局数组、原地复用，不清就会**沿用上一帧同下标那个对象的
     			// 阵营和名字** —— 表现是装饰物被当成角色画出来、还顶着别人的名字，
     			// 并且 内核人物数量 虚高。正常游玩时类名基本都能命中 player/boss，
     			// 所以这个洞主要在开「绘制调试」时发作。
-    			data[指针数量].阵营 = 0;
-    			data[指针数量].str[0] = '\0';
-    			if (strstr(过滤类名.c_str(), "boss") != NULL){
+    			data[entity_count].camp = 0;
+    			data[entity_count].str[0] = '\0';
+    			if (strstr(filter_class_name.c_str(), "boss") != NULL){
     			//data[指针数量].str=getboss(过滤类名.c_str());
-    			strcpy(data[指针数量].str, getboss(过滤类名.c_str()));
-    			data[指针数量].阵营=1;
+    			strcpy(data[entity_count].str, getboss(filter_class_name.c_str()));
+    			data[entity_count].camp=1;
     			}
-    			else if (strstr(过滤类名.c_str(), "player") != NULL||strstr(类名.c_str(), "npc_deluosi_dress_ghost") != NULL||strstr(类名.c_str(), "h55_pendant_huojian") != NULL){
+    			else if (strstr(filter_class_name.c_str(), "player") != NULL||strstr(class_name.c_str(), "npc_deluosi_dress_ghost") != NULL||strstr(class_name.c_str(), "h55_pendant_huojian") != NULL){
     			//data[指针数量].str=getplayer(过滤类名.c_str());
-    			strcpy(data[指针数量].str, getplayer(过滤类名.c_str()));
-    			data[指针数量].阵营=2;
+    			strcpy(data[entity_count].str, getplayer(filter_class_name.c_str()));
+    			data[entity_count].camp=2;
     			}
-    			else if (strstr(过滤类名.c_str(), "scene") != NULL){
-    			const char* scene_result = getscene(过滤类名.c_str());
+    			else if (strstr(filter_class_name.c_str(), "scene") != NULL){
+    			const char* scene_result = getscene(filter_class_name.c_str());
     			if (scene_result == NULL) continue;
-    			strcpy(data[指针数量].str, scene_result);
-    			data[指针数量].阵营=3;
+    			strcpy(data[entity_count].str, scene_result);
+    			data[entity_count].camp=3;
     			}
-    			else if (strstr(过滤类名.c_str(), "prop") != NULL){
-    			const char* prop_result = getprop(过滤类名.c_str());
+    			else if (strstr(filter_class_name.c_str(), "prop") != NULL){
+    			const char* prop_result = getprop(filter_class_name.c_str());
     			if (prop_result == NULL) continue;
-    			strcpy(data[指针数量].str, prop_result);
-    			data[指针数量].阵营=4;
+    			strcpy(data[entity_count].str, prop_result);
+    			data[entity_count].camp=4;
     			}
 
-    			else if (strstr(过滤类名.c_str(), "redqueen") != NULL&&strstr(过滤类名.c_str(), "mirror") != NULL&&strstr(过滤类名.c_str(), "model") != NULL){
+    			else if (strstr(filter_class_name.c_str(), "redqueen") != NULL&&strstr(filter_class_name.c_str(), "mirror") != NULL&&strstr(filter_class_name.c_str(), "model") != NULL){
     			// fx/model/redqueen_mirror_model_obj_001.gim：准备放镜时的预览镜子(PlaceIndicator.rtc_model)，
     			// 常驻复用同一个对象，只在准备阶段可见。用法见 Draw_Main 里的镜线计算
-    			data[指针数量].阵营=5;
-    			镜子预览 = 对象;
+    			data[entity_count].camp=5;
+    			mirror_preview_local = cur_obj;
     			}
     			//sprintf(data[指针数量].类名, "%s", 过滤类名.c_str());
-    			strcpy(data[指针数量].类名, 过滤类名.c_str());
-    			data[指针数量].objcoor=getPtr64(对象+0x28);
-    			if (!首帧打印){
+    			strcpy(data[entity_count].class_name, filter_class_name.c_str());
+    			data[entity_count].objcoor=getPtr64(cur_obj+0x28);
+    			if (!first_frame_logged){
         			printf("[实体] %s 地址=0x%llX 坐标地址=0x%llX 坐标=(%.1f,%.1f,%.1f) 类名=%s\n",
-        			       data[指针数量].str, (unsigned long long)对象,
-        			       (unsigned long long)data[指针数量].objcoor,
-        			       getFloat(data[指针数量].objcoor + 0xa0),
-        			       getFloat(data[指针数量].objcoor + 0xa4),
-        			       getFloat(data[指针数量].objcoor + 0xa8),
-        			       data[指针数量].类名);
+        			       data[entity_count].str, (unsigned long long)cur_obj,
+        			       (unsigned long long)data[entity_count].objcoor,
+        			       getFloat(data[entity_count].objcoor + 0xa0),
+        			       getFloat(data[entity_count].objcoor + 0xa4),
+        			       getFloat(data[entity_count].objcoor + 0xa8),
+        			       data[entity_count].class_name);
         		}
-    			指针数量++;
+    			entity_count++;
 			}
     			
 			//红夫人模式：本体和镜中红夫人的类名都是 redqueen.gim，只能靠对象字段区分。
@@ -753,26 +773,33 @@ void read_thread(long int PD1,long int PD2,long int PD3)
 			// 镜面 = 本体与镜中红夫人连线的垂直平分线，已用 Python 侧 MaryMirrorUnit.position/direction 验证。
 			// 镜子没放出时镜中红夫人停在 y≈-1000，下面坐标读取处的 Z>=-300 会让 mirror=false。
 			if (pd1==450){
-			    uintptr_t coorPtr = getPtr64(对象 + 0x28);
-			    if (strstr(过滤类名.c_str(), "boss") != NULL && strstr(过滤类名.c_str(), "redqueen") != NULL && strstr(过滤类名.c_str(), "mirror") == NULL
+			    uintptr_t coorPtr = getPtr64(cur_obj + 0x28);
+			    if (strstr(filter_class_name.c_str(), "boss") != NULL && strstr(filter_class_name.c_str(), "redqueen") != NULL && strstr(filter_class_name.c_str(), "mirror") == NULL
 			        && getFloat(coorPtr + 0xa0) != 0 && getFloat(coorPtr + 0xa8) != 0) {
-			        uint8_t 种类 = 0;
-			        vm_readv(对象 + 0x6D, &种类, 1);
-			        if (种类 & 0x40)      红夫人 = 对象;       // 本体
-			        else if (种类 & 0x80) 红夫人镜像 = 对象;   // 镜中红夫人
+			        uint8_t kind = 0;
+			        vm_readv(cur_obj + 0x6D, &kind, 1);
+			        if (kind & 0x40)      rq_local = cur_obj;       // 本体
+			        else if (kind & 0x80) rq_mirror_local = cur_obj;   // 镜中红夫人
 			    }
-    			if (strstr(过滤类名.c_str(), "boss") != NULL && strstr(过滤类名.c_str(), "mirror") != NULL
+    			if (strstr(filter_class_name.c_str(), "boss") != NULL && strstr(filter_class_name.c_str(), "mirror") != NULL
     			    && getFloat(coorPtr + 0xa0) != 0 && getFloat(coorPtr + 0xa8) != 0)
     			{
-    		    	镜子=对象;
+    		    	mirror_local=cur_obj;
     			}    			
 			}    						
         }
-        if (!首帧打印){
-            首帧打印 = true;
+        if (!first_frame_logged){
+            first_frame_logged = true;
             printf("[首帧调试] 矩阵16值已打印 实体列表已打印\n");
         }
-        数量 = 指针数量;
+        // 本轮结果一次性发布。prophet_local 为空(这轮没扫到监管)时保留上一轮的文本，
+        // 跟原来"prophet_text 从不清零"的行为一致
+        redqueen_obj        = rq_local;
+        redqueen_mirror_obj = rq_mirror_local;
+        mirror_obj          = mirror_local;
+        mirror_preview_obj  = mirror_preview_local;
+        if (prophet_local[0]) memcpy(prophet_text, prophet_local, sizeof(prophet_text));
+        data_count = entity_count;
         sleep(3);
     }
 }
@@ -804,8 +831,8 @@ void read_thread(long int PD1,long int PD2,long int PD3)
 // +0x6D 与 +0x73 都是单字节，分别藏在 +0x6C / +0x70 这两个 dword 里。
 //   +0x73 = 1  -> 当前活跃/在场（常见的 0x1000000 就是这个字节的 dword 形式）
 //   +0x6D      -> 实体种类位域: 0x40=角色/生物  0x10=玩家阵营相关  0x00=纯场景装饰
-static inline unsigned 实体活跃位(uintptr_t obj) { return (getDword(obj + 0x70) >> 24) & 0xFF; }
-static inline unsigned 实体种类位(uintptr_t obj) { return (getDword(obj + 0x6C) >> 8)  & 0xFF; }
+static inline unsigned entity_active_byte(uintptr_t obj) { return (getDword(obj + 0x70) >> 24) & 0xFF; }
+static inline unsigned entity_kind_byte(uintptr_t obj) { return (getDword(obj + 0x6C) >> 8)  & 0xFF; }
 
 // **千万不要拿活跃位当"本局是否存在"用**：它是"当前对本机客户端可见"的意思，跟视角走。
 // 实测同一张图，监管视角下 12 台密码机活跃位全是 1，换成求生者视角只剩 1 台是 1。
@@ -814,19 +841,19 @@ static inline unsigned 实体种类位(uintptr_t obj) { return (getDword(obj + 0
 // 真正视角无关的存在性标记是 +0x240：
 //   实测 约瑟夫相机 7/7 = 0，破轮台 4/4 = 0（这两类都是每局默认加载、本局并不存在的装饰）
 //        密码机 真的 7 个 = 2 / 假的 5 个 = 0，箱子、求生者、监管 全部 = 2
-static inline bool 实体本局存在(uintptr_t obj)
+static inline bool entity_exists(uintptr_t obj)
 {
     return getDword(obj + 0x240) == 2;
 }
 // 破译进度配色：<20 绿、20~60 黄、>60 红
-static inline ImColor 进度颜色(float v)
+static inline ImColor progress_color(float v)
 {
-    if (v < 20.0f)  return 绿色;
-    if (v <= 60.0f) return 黄色;
-    return 红色;
+    if (v < 20.0f)  return color_green;
+    if (v <= 60.0f) return color_yellow;
+    return color_red;
 }
 
-static inline bool 是真实密码机(uintptr_t obj)
+static inline bool is_real_generator(uintptr_t obj)
 {
     // 活跃位 + 一个密码机专用的辅助值。单用任何一个都不够：
     //   只判 +0x1a0 -> 未激活的候选机器该值恰好也可能是 500
@@ -838,12 +865,12 @@ static inline bool 是真实密码机(uintptr_t obj)
 // VP矩阵本身能反解出相机世界坐标(实测与真实字段差约6单位/0.5游戏米)，精度不足以直接用，
 // 但足够当"校验器"：在窗口内扫，谁最接近反解值谁就是真正的相机字段。
 // 这样以后引擎再挪这个字段，不用人工重新找。
-static int g_相机偏移 = 0;
-static int g_相机尝试 = 0;
-static int 取相机偏移(uint64_t Matrix)
+static int g_cam_offset = 0;
+static int g_cam_tries = 0;
+static int get_cam_offset(uint64_t Matrix)
 {
-    if (g_相机偏移 != 0) return g_相机偏移;
-    if (++g_相机尝试 > 60) { g_相机偏移 = -0x290; return g_相机偏移; }   // 找不到就退回旧值，不卡绘制
+    if (g_cam_offset != 0) return g_cam_offset;
+    if (++g_cam_tries > 60) { g_cam_offset = -0x290; return g_cam_offset; }   // 找不到就退回旧值，不卡绘制
 
     float m[16];
     for (int i = 0; i < 16; i++) m[i] = getFloat(Matrix + i*4);
@@ -874,7 +901,7 @@ static int 取相机偏移(uint64_t Matrix)
         if (err < bestErr){ bestErr = err; best = off; }
     }
     if (best != 0 && bestErr < 60.0f){
-        g_相机偏移 = best;
+        g_cam_offset = best;
         printf("[相机命中] 偏移=%d(-0x%X) 反解=(%.1f,%.1f,%.1f) 实读=(%.1f,%.1f,%.1f) 误差=%.2f\n",
                best, -best, cx, cy, cz,
                getFloat(Matrix+best), getFloat(Matrix+best+4), getFloat(Matrix+best+8), bestErr);
@@ -884,27 +911,27 @@ static int 取相机偏移(uint64_t Matrix)
 }
 
 void Draw_Main(ImDrawList *Draw){
-    if (libbase == 0 || 状态 == 0) return;  // 数据未就绪，跳过本帧绘制
-    int 内核人物数量 = 0;
-    const bool 模仿者绘制中 = false; // 发布版本: 注入功能已停用, SoHook::IsCopycatDrawingActive() 不再调用
+    if (libbase == 0 || read_state == 0) return;  // 数据未就绪，跳过本帧绘制
+    int char_count = 0;
+    const bool copycat_drawing = false; // 发布版本: 注入功能已停用, SoHook::IsCopycatDrawingActive() 不再调用
 
     // ---- 自身锚点：引擎自己持有的答案。相机深度启发式兜底已停用，这是唯一来源 ----
     // g_cam_ctrl.unit 就是"当前视角/操控的单位"，切到机械玩偶/梦之信徒时会跟着换，
     // 所以这里每帧重取：一旦换了操控对象，自身锚点立刻跟上。
     // (不能用 g_unit —— 那是"我的主角色"，切从属时纹丝不动，会高亮错人。见 PySelf.h)
-    uint64_t 权威自身 = 0;
-    const bool 有权威自身 = 本机::锚点(权威自身);
-    if (有权威自身) {
-        自身 = (uintptr_t)权威自身;
-        int c = 本机::阵营();
-        if (c == 1 || c == 2) 自身阵营 = (uintptr_t)c;
+    uint64_t auth_self = 0;
+    const bool has_auth_self = PySelf::anchor(auth_self);
+    if (has_auth_self) {
+        self_obj = (uintptr_t)auth_self;
+        int c = PySelf::camp();
+        if (c == 1 || c == 2) self_camp = (uintptr_t)c;
     }
 
     Matrix = getPtr64(getPtr64(libbase + MatrixOffset) + 0xa58) + 0x2c0; //矩阵
-    int 相机偏移 = 取相机偏移(Matrix);
-    M.X = getFloat(Matrix + 相机偏移);
-    M.Z = getFloat(Matrix + 相机偏移 + 4);
-    M.Y = getFloat(Matrix + 相机偏移 + 8);
+    int cam_offset = get_cam_offset(Matrix);
+    M.X = getFloat(Matrix + cam_offset);
+    M.Z = getFloat(Matrix + cam_offset + 4);
+    M.Y = getFloat(Matrix + cam_offset + 8);
     
     // ---- 红夫人镜面：两个来源，先放下的镜子，其次准备阶段的预览镜子 ----
     // (1) 镜子已放下：本体与镜中红夫人连线的垂直平分线(已用 Python 侧 MaryMirrorUnit 验证)。
@@ -914,77 +941,77 @@ void Draw_Main(ImDrawList *Draw){
     //       +0x90/+0x98 = 局部 Z 轴 = 投掷方向 = 镜面法向(与 Python rtc_model.world_transformation 第 3 行一致)
     //     可见位 +0x73 只在准备阶段为 1。
     mirror = false;
-    bool 本体有效 = false, 镜像有效 = false;
-    if (红夫人 != 0) {
-        uintptr_t 红夫人坐标指针 = getPtr64(红夫人 + 0x28);
-        if (红夫人坐标指针 != 0) {
-            红夫人X = getFloat(红夫人坐标指针 + 0xa0);
-            红夫人Z = getFloat(红夫人坐标指针 + 0xa4);
-            红夫人Y = getFloat(红夫人坐标指针 + 0xa8);
-            本体有效 = 红夫人Z >= -300 && 红夫人X != 0 && 红夫人Y != 0;
+    bool body_valid = false, mirror_valid = false;
+    if (redqueen_obj != 0) {
+        uintptr_t redqueen_coor = getPtr64(redqueen_obj + 0x28);
+        if (redqueen_coor != 0) {
+            redqueen_x = getFloat(redqueen_coor + 0xa0);
+            redqueen_z = getFloat(redqueen_coor + 0xa4);
+            redqueen_y = getFloat(redqueen_coor + 0xa8);
+            body_valid = redqueen_z >= -300 && redqueen_x != 0 && redqueen_y != 0;
         }
     }
-    if (红夫人镜像 != 0) {
-        uintptr_t 镜像坐标指针 = getPtr64(红夫人镜像 + 0x28);
-        if (镜像坐标指针 != 0) {
-            红夫人镜像X = getFloat(镜像坐标指针 + 0xa0);
-            红夫人镜像Z = getFloat(镜像坐标指针 + 0xa4);
-            红夫人镜像Y = getFloat(镜像坐标指针 + 0xa8);
-            镜像有效 = 红夫人镜像Z >= -300 && 红夫人镜像X != 0 && 红夫人镜像Y != 0;
+    if (redqueen_mirror_obj != 0) {
+        uintptr_t mirror_coor = getPtr64(redqueen_mirror_obj + 0x28);
+        if (mirror_coor != 0) {
+            redqueen_mirror_x = getFloat(mirror_coor + 0xa0);
+            redqueen_mirror_z = getFloat(mirror_coor + 0xa4);
+            redqueen_mirror_y = getFloat(mirror_coor + 0xa8);
+            mirror_valid = redqueen_mirror_z >= -300 && redqueen_mirror_x != 0 && redqueen_mirror_y != 0;
         }
     }
-    if (本体有效 && 镜像有效) {
-        float mx = (红夫人X + 红夫人镜像X) / 2.0f, my = (红夫人Y + 红夫人镜像Y) / 2.0f;
-        float dx = 红夫人镜像X - 红夫人X,      dy = 红夫人镜像Y - 红夫人Y;   // 法向
+    if (body_valid && mirror_valid) {
+        float mx = (redqueen_x + redqueen_mirror_x) / 2.0f, my = (redqueen_y + redqueen_mirror_y) / 2.0f;
+        float dx = redqueen_mirror_x - redqueen_x,      dy = redqueen_mirror_y - redqueen_y;   // 法向
         if (dx * dx + dy * dy > 1e-4f) {
-            镜线X1 = mx;      镜线Y1 = my;
-            镜线X2 = mx - dy; 镜线Y2 = my + dx;                              // 沿镜面方向
+            mirror_line_x1 = mx;      mirror_line_y1 = my;
+            mirror_line_x2 = mx - dy; mirror_line_y2 = my + dx;                              // 沿镜面方向
             mirror = true;
         }
     }
-    if (!mirror && 镜子预览 != 0) {
-        uint8_t 可见 = 0;
-        vm_readv(镜子预览 + 0x73, &可见, 1);
-        uintptr_t cp = getPtr64(镜子预览 + 0x28);
-        if (可见 == 1 && cp != 0) {
+    if (!mirror && mirror_preview_obj != 0) {
+        uint8_t visible = 0;
+        vm_readv(mirror_preview_obj + 0x73, &visible, 1);
+        uintptr_t cp = getPtr64(mirror_preview_obj + 0x28);
+        if (visible == 1 && cp != 0) {
             float px0 = getFloat(cp + 0xa0), pz0 = getFloat(cp + 0xa4), py0 = getFloat(cp + 0xa8);
             float nx = getFloat(cp + 0x90), ny = getFloat(cp + 0x98);
-            float 模 = nx * nx + ny * ny;
-            if (px0 != 0 && py0 != 0 && pz0 >= -300 && 模 > 0.9f && 模 < 1.1f) {
-                镜线X1 = px0;      镜线Y1 = py0;
-                镜线X2 = px0 - ny; 镜线Y2 = py0 + nx;
+            float norm_sq = nx * nx + ny * ny;
+            if (px0 != 0 && py0 != 0 && pz0 >= -300 && norm_sq > 0.9f && norm_sq < 1.1f) {
+                mirror_line_x1 = px0;      mirror_line_y1 = py0;
+                mirror_line_x2 = px0 - ny; mirror_line_y2 = py0 + nx;
                 mirror = true;
             }
         }
     }
     vm_readv(Matrix, matrix, 64);
-    if (!首帧矩阵){
-        首帧矩阵 = true;
+    if (!first_matrix_logged){
+        first_matrix_logged = true;
         printf("[矩阵]");
         for (int i = 0; i < 16; i++) printf(" %.4f", matrix[i]);
         printf("\n");
     }  // 直接从Matrix读16个float
     if (show_draw_prophet){
-        auto textSize = ImGui::CalcTextSize(监管者预知, 0, 25);
-        Draw->AddText({px-(textSize.x/2),130}, 红色, 监管者预知);
+        auto textSize = ImGui::CalcTextSize(prophet_text, 0, 25);
+        Draw->AddText({px-(textSize.x/2),130}, color_red, prophet_text);
     }
 
     // 已破译 4 台后，剩下那台在修的就是最后一台 —— 单独用进度条标出来
     {
-        float 最后进度 = 0.f;
-        if (show_draw_secret_mechine && 密码机进度::最后一台(最后进度)){
-            char 文字[64];
-            snprintf(文字, sizeof(文字), "最后一台 %.1f%%", 最后进度);
-            auto ts = ImGui::CalcTextSize(文字, 0, 25);
-            const float 条宽 = 160.0f, 条高 = 14.0f, 间隙 = 8.0f;
-            float x0 = px - (条宽 + 间隙 + ts.x) / 2.0f;
+        float last_progress = 0.f;
+        if (show_draw_secret_mechine && PyProgress::last_generator(last_progress)){
+            char label[64];
+            snprintf(label, sizeof(label), "最后一台 %.1f%%", last_progress);
+            auto ts = ImGui::CalcTextSize(label, 0, 25);
+            const float bar_w = 160.0f, bar_h = 14.0f, gap = 8.0f;
+            float x0 = px - (bar_w + gap + ts.x) / 2.0f;
             float y0 = 158.0f;                                  // 预知监管那行(y=130)的下一行
-            ImColor c = 进度颜色(最后进度);
-            float 填充 = 条宽 * (最后进度 / 100.0f);
-            if (填充 > 0.0f)
-                Draw->AddRectFilled({x0, y0}, {x0 + 填充, y0 + 条高}, c);
-            Draw->AddRect({x0, y0}, {x0 + 条宽, y0 + 条高}, ImColor(255,255,255,255));
-            Draw->AddText({x0 + 条宽 + 间隙, y0 + 条高/2.0f - ts.y/2.0f}, c, 文字);
+            ImColor c = progress_color(last_progress);
+            float fill_w = bar_w * (last_progress / 100.0f);
+            if (fill_w > 0.0f)
+                Draw->AddRectFilled({x0, y0}, {x0 + fill_w, y0 + bar_h}, c);
+            Draw->AddRect({x0, y0}, {x0 + bar_w, y0 + bar_h}, ImColor(255,255,255,255));
+            Draw->AddText({x0 + bar_w + gap, y0 + bar_h/2.0f - ts.y/2.0f}, c, label);
         }
     }
 
@@ -995,17 +1022,17 @@ void Draw_Main(ImDrawList *Draw){
     // 也不能靠场景侧判据补救：实测两扇门的类名都不一样(prop_30 / wooddoor01a)，
     // 而且 +0x240 两扇都是 0 —— "最可靠的存在性判据"在大门上失效。
     if (show_draw_Door){
-        for (int i = 0; i < 密码机进度::大门数(); i++){
-            密码机进度::大门条目 门;
-            if (!密码机进度::取大门(i, 门)) continue;
-            if (密码机进度::已开启(门)) continue;          // 已经开了的不用再画
-            if (!门.可开) continue;                         // 还没通电(不可开)的不画
+        for (int i = 0; i < PyProgress::door_count(); i++){
+            PyProgress::DoorEntry door;
+            if (!PyProgress::get_door(i, door)) continue;
+            if (PyProgress::door_opened(door)) continue;          // 已经开了的不用再画
+            if (!door.can_open) continue;                         // 还没通电(不可开)的不画
 
-            uintptr_t 坐标指针 = getPtr64((uintptr_t)门.场景对象 + 0x28);
-            if (坐标指针 == 0) continue;
-            float mx = getFloat(坐标指针 + 0xa0);
-            float mz = getFloat(坐标指针 + 0xa4);          // +0xa4 是高度
-            float my = getFloat(坐标指针 + 0xa8);
+            uintptr_t coor_ptr = getPtr64((uintptr_t)door.scene_obj + 0x28);
+            if (coor_ptr == 0) continue;
+            float mx = getFloat(coor_ptr + 0xa0);
+            float mz = getFloat(coor_ptr + 0xa4);          // +0xa4 是高度
+            float my = getFloat(coor_ptr + 0xa8);
             if (mx == 0 && my == 0) continue;
 
             float cam = matrix[3]*mx + matrix[7]*mz + matrix[11]*my + matrix[15];
@@ -1013,35 +1040,40 @@ void Draw_Main(ImDrawList *Draw){
             float sx = px + (matrix[0]*mx + matrix[4]*mz + matrix[8]*my + matrix[12]) / cam * px;
             float sy = py - (matrix[1]*mx + matrix[5]*(mz+8.5f) + matrix[9]*my + matrix[13]) / cam * py;
 
-            int 米 = (int)(sqrt(pow(mx - Z.X, 2) + pow(my - Z.Y, 2) + pow(mz - Z.Z, 2)) / 距离比例);
-            char 文字[64];
-            if (门.开启中)      snprintf(文字, sizeof(文字), "[%.1f%%]", 门.进度);
-            else                snprintf(文字, sizeof(文字), "[%.1f%%]",  门.进度);   // 不可开时按灰色画，见下
+            int meters = (int)(sqrt(pow(mx - Z.X, 2) + pow(my - Z.Y, 2) + pow(mz - Z.Z, 2)) / dist_scale);
+            char label[64];
+            if (door.is_opening)      snprintf(label, sizeof(label), "[%.1f%%]", door.progress);
+            else                snprintf(label, sizeof(label), "[%.1f%%]",  door.progress);   // 不可开时按灰色画，见下
 
             // 有进度就在文字上方画一条，跟密码机那套一致
-            if (门.进度 > 0.05f){
-                const float 条宽 = 120.0f, 条高 = 10.0f;
-                float bx = sx - 条宽 / 2.0f, by = sy - 条高 - 3.0f;
-                Draw->AddRectFilled({bx, by}, {bx + 条宽 * (门.进度 / 100.0f), by + 条高}, 进度颜色(门.进度));
-                Draw->AddRect({bx, by}, {bx + 条宽, by + 条高}, ImColor(255,255,255,255));
+            if (door.progress > 0.05f){
+                const float bar_w = 120.0f, bar_h = 10.0f;
+                float bx = sx - bar_w / 2.0f, by = sy - bar_h - 3.0f;
+                Draw->AddRectFilled({bx, by}, {bx + bar_w * (door.progress / 100.0f), by + bar_h}, progress_color(door.progress));
+                Draw->AddRect({bx, by}, {bx + bar_w, by + bar_h}, ImColor(255,255,255,255));
             }
-            auto ts = ImGui::CalcTextSize(文字, 0, 25);
-            Draw->AddText({sx - ts.x/2.0f, sy}, 门.可开 ? 进度颜色(门.进度) : ImColor(180,180,180,255), 文字);
+            auto ts = ImGui::CalcTextSize(label, 0, 25);
+            Draw->AddText({sx - ts.x/2.0f, sy}, door.can_open ? progress_color(door.progress) : ImColor(180,180,180,255), label);
         }
     }
 
-    for (int i = 0; i < 数量; i++){
+    for (int i = 0; i < data_count; i++){
     
-        if (strstr(data[i].类名, "buzz") != NULL)
+        if (strstr(data[i].class_name, "buzz") != NULL)
             continue;//跳过不知所谓的东西
-        if (strstr(data[i].类名, "nvyao.gim") != NULL)
+        if (strstr(data[i].class_name, "nvyao.gim") != NULL)
             continue;//跳过女妖蜡烛
-        D.X = getFloat(data[i].objcoor + 0xa0);
-        D.Z = getFloat(data[i].objcoor + 0xa4);
-        D.Y = getFloat(data[i].objcoor + 0xa8);
+        // 三个坐标是连续的 12 字节，一次读完。原来是三次 getFloat = 三次 ioctl，
+        // 而每次驱动读约 3µs，30 个实体 60fps 下这一项就占渲染线程约 1% CPU。
+        // 读失败时保持 0，和 getFloat 失败返回 0 的行为一致。
+        float xyz[3] = {0, 0, 0};
+        vm_readv(data[i].objcoor + 0xa0, xyz, 12);
+        D.X = xyz[0];
+        D.Z = xyz[1];
+        D.Y = xyz[2];
 
         // 已锁定的自身: 只负责判断"还活着没"+持续更新坐标, 不重新参与后面的识别/绘制逻辑
-        if (自身 != 0 && data[i].obj == 自身) {
+        if (self_obj != 0 && data[i].obj == self_obj) {
             if (!ShouldSkipEntity(data[i]) && !(D.X==0 && D.Y==0) && D.Z>-300) {
                 Z.X = D.X; Z.Z = D.Z; Z.Y = D.Y;
             }
@@ -1055,11 +1087,11 @@ void Draw_Main(ImDrawList *Draw){
         // 本体集合不可用(准备阶段/大厅/读取失败)时不过滤，照旧按类名画。
         // 大厅/准备阶段(units_by_type 读全了且没有键 1/2)：没有任何玩家单位，场景里的人物对象全是
         // 无宿主的时装挂件(头饰/袖子)，阵营 1/2 整类不画。预知监管在读取循环里算，不受影响
-        if ((data[i].阵营 == 1 || data[i].阵营 == 2) && 本机::局外())
+        if ((data[i].camp == 1 || data[i].camp == 2) && PySelf::in_lobby())
             continue;
-        if ((data[i].阵营 == 1 || data[i].阵营 == 2) && 本机::本体集合可用()
-            && (strstr(data[i].类名, "player") != NULL || strstr(data[i].类名, "boss") != NULL)
-            && !本机::是本体(data[i].obj))
+        if ((data[i].camp == 1 || data[i].camp == 2) && PySelf::body_set_ready()
+            && (strstr(data[i].class_name, "player") != NULL || strstr(data[i].class_name, "boss") != NULL)
+            && !PySelf::is_body(data[i].obj))
             continue;
 
         if (D.X==0 || D.Y==0){
@@ -1068,16 +1100,15 @@ void Draw_Main(ImDrawList *Draw){
 		if (D.Z<=-300){
 		    continue;//跳过地下
 		}
-		if (data[i].阵营 == 1 || data[i].阵营 == 2) 内核人物数量++;
+		if (data[i].camp == 1 || data[i].camp == 2) char_count++;
 		// 本体是监管时，游戏自己就会显示监管者个体，这里不再重复画任何监管者。
 		// 只认 CPython 锚点给的阵营：兜底的相机深度启发式可能把求生者误判成监管，
 		// 那样会让求生者视角下的监管整个消失，代价远大于多画一个。
-		if (有权威自身 && 自身阵营 == 1 && data[i].阵营 == 1) continue;
-		int jxpd = getDword(data[i].obj + 0x70);
+		if (has_auth_self && self_camp == 1 && data[i].camp == 1) continue;
+		// 这里原本还读一次 +0x70(jxpd) 并算 cam_dist / niexi_dist，三者都没有任何地方使用，已删。
+		// jxpd 那次是每实体每帧一次驱动读，删掉直接省 CPU；另两个只是浮点运算。
 		camera = matrix[3] * D.X + matrix[7] * D.Z + matrix[11] * D.Y + matrix[15];
-        距离 = sqrt(pow(D.X - Z.X, 2) + pow(D.Y - Z.Y, 2) + pow(D.Z - Z.Z, 2)) / 距离比例;
-        矩阵视野距离 = sqrt(pow(D.X - M.X, 2) + pow(D.Y - M.Y, 2) + pow(D.Z - M.Z, 2)) / 距离比例;
-		孽蜥距离 = sqrt(pow(D.X - Z.X, 2) + pow(D.Y - Z.Y, 2)) / 距离比例;
+        dist = sqrt(pow(D.X - Z.X, 2) + pow(D.Y - Z.Y, 2) + pow(D.Z - Z.Z, 2)) / dist_scale;
 		r_x = px + (matrix[0] * D.X + matrix[4] * D.Z + matrix[8] * D.Y + matrix[12]) / camera * px;
         r_y = py - (matrix[1] * D.X + matrix[5] * (D.Z+ 8.5) + matrix[9] * (D.Y) + matrix[13]) / camera * py;
         r_w = py - (matrix[1] * D.X + matrix[5] * (D.Z+ 28.5) + matrix[9] * (D.Y) + matrix[13]) / camera * py;
@@ -1088,7 +1119,7 @@ void Draw_Main(ImDrawList *Draw){
 		Y1 = r_y - H / 2;	// Y1
 		X2 = X1 + W;		// X2
 		Y2 = Y1 + H;		// Y2
-		if (距离>=300){
+		if (dist>=300){
             continue;
         }
         if (W>0){
@@ -1098,23 +1129,23 @@ void Draw_Main(ImDrawList *Draw){
                 // 判据用 +0x240 而不是活跃位：活跃位是"当前对本机可见"，跟视角走，
                 // 求生者视角下大量真实对象的活跃位也是 0，用它会把真东西一起挡掉。
                 // 想看全部对象(比如排查新偏移时)，把下面这行注释掉即可。
-                if (!实体本局存在(data[i].obj)) continue;
+                if (!entity_exists(data[i].obj)) continue;
                 std::string test;
                 sprintf(objtext, "%lx", data[i].obj);
                 test += " [";
-                test += std::to_string((int) 距离);    
+                test += std::to_string((int) dist);    
                 test += " 米]  0x";
                 test += objtext;    
                 test += " [类名] ";
-                test += data[i].类名;
+                test += data[i].class_name;
                 auto textSize = ImGui::CalcTextSize(test.c_str(), 0, 25);
                 Draw->AddText({r_x-(textSize.x/2),r_y}, ImColor(255,200,0,255), test.c_str());
             }
         
-            if (strstr(data[i].类名, "camera") != NULL && 距离 < 38){
+            if (strstr(data[i].class_name, "camera") != NULL && dist < 38){
                 // 约瑟夫的相机每局都会默认加载十几个，跟这局有没有约瑟夫无关。
                 // 实测那些默认加载的 +0x240 全是 0（7/7），本局真实存在的物件是 2。
-                if (!实体本局存在(data[i].obj)) continue;
+                if (!entity_exists(data[i].obj)) continue;
                 if (getDword(data[i].obj + 0xa8)==256){
 		            continue;//跳过使用过的椅子
 		        }
@@ -1128,9 +1159,9 @@ void Draw_Main(ImDrawList *Draw){
             
 
 		
-    		if (data[i].阵营==3)
+    		if (data[i].camp==3)
     		{
-    		    if (strstr(data[i].类名, "dm65_scene_prop_30") != NULL){
+    		    if (strstr(data[i].class_name, "dm65_scene_prop_30") != NULL){
     			    std::string s;
     		        if (show_draw_Door){
                         s += "[大门]";
@@ -1139,7 +1170,7 @@ void Draw_Main(ImDrawList *Draw){
                     Draw->AddText({r_x-(textSize.x/2),r_y}, ImColor(255,200,0,255), s.c_str());
     		    }
     		
-    		    else if (strstr(data[i].类名, "dm65_scene_prop_01") != NULL&&距离<38){
+    		    else if (strstr(data[i].class_name, "dm65_scene_prop_01") != NULL&&dist<38){
     			    std::string s;
     		        if (show_draw_Box){                          
     		            if (getDword(data[i].obj + 0x148)==0){
@@ -1148,10 +1179,10 @@ void Draw_Main(ImDrawList *Draw){
                         s += "[道具箱]";
                     }    
                     auto textSize = ImGui::CalcTextSize(s.c_str(), 0, 25);
-                    Draw->AddText({r_x-(textSize.x/2),r_y}, 红色, s.c_str());
+                    Draw->AddText({r_x-(textSize.x/2),r_y}, color_red, s.c_str());
     		    }
 
-    		    else if (strstr(data[i].类名, "dm65_scene_gallow") != NULL&&strstr(data[i].类名, "bashou") == NULL&&距离<38){
+    		    else if (strstr(data[i].class_name, "dm65_scene_gallow") != NULL&&strstr(data[i].class_name, "bashou") == NULL&&dist<38){
     			    std::string s;
     		        if (show_draw_Chair){                          
     		            if (getDword(data[i].obj + 0xa8)==256){
@@ -1160,73 +1191,73 @@ void Draw_Main(ImDrawList *Draw){
                         s += "[狂欢之椅]";
                     }
                     auto textSize = ImGui::CalcTextSize(s.c_str(), 0, 25);
-                    Draw->AddText({r_x-(textSize.x/2),r_y}, 红色, s.c_str());
+                    Draw->AddText({r_x-(textSize.x/2),r_y}, color_red, s.c_str());
     		    }
     		
-    		    else if (strstr(data[i].类名, "dm65_scene_prop_76") != NULL){
+    		    else if (strstr(data[i].class_name, "dm65_scene_prop_76") != NULL){
     			    std::string s;
     		        if (show_draw_Cellar){                                                  
                             s += "[地窖] ";
-                            s += std::to_string((int) 距离);    
+                            s += std::to_string((int) dist);    
                             s += " 米 ";
                     }
                     auto textSize = ImGui::CalcTextSize(s.c_str(), 0, 25);
-                    Draw->AddText({r_x-(textSize.x/2),r_y}, 紫色, s.c_str());
+                    Draw->AddText({r_x-(textSize.x/2),r_y}, color_purple, s.c_str());
     		    }
 
-    	    else if (strstr(data[i].类名, "sender") != NULL){
-    	        // 判据见上面 是真实密码机() 的注释。若发现密码机被破译完成后从叠加层消失，改那里。
-    	        if (show_draw_secret_mechine && 是真实密码机(data[i].obj)){
+    	    else if (strstr(data[i].class_name, "sender") != NULL){
+    	        // 判据见上面 is_real_generator() 的注释。若发现密码机被破译完成后从叠加层消失，改那里。
+    	        if (show_draw_secret_mechine && is_real_generator(data[i].obj)){
     	            // 进度来自 Python 侧的 GeneratorUnit，靠 model 指针身份配对(见 PyProgress.h)。
     	            // 配不上时(model 为空/链路失效)退化成原来的 "[密码机] X.X 米"。
-    	            float 进度 = 0.f;
-    	            bool 有进度 = 密码机进度::查询(data[i].obj, D.X, D.Y, 进度);
-    	            if (!(有进度 && 密码机进度::已破译(进度))){      // 破译完的机器本身和进度都不画
+    	            float progress = 0.f;
+    	            bool has_progress = PyProgress::lookup(data[i].obj, D.X, D.Y, progress);
+    	            if (!(has_progress && PyProgress::is_decoded(progress))){      // 破译完的机器本身和进度都不画
     	                std::ostringstream oss;
-    	                oss << std::fixed << std::setprecision(1) << 距离;
-    	                std::string 距离文本 = " " + oss.str() + " 米";
-    	                char 头[24];
-    	                if (有进度) snprintf(头, sizeof(头), "[%.1f%%]", 进度);
-    	                else        snprintf(头, sizeof(头), "[密码机]");
+    	                oss << std::fixed << std::setprecision(1) << dist;
+    	                std::string dist_text = " " + oss.str() + " 米";
+    	                char head[24];
+    	                if (has_progress) snprintf(head, sizeof(head), "[%.1f%%]", progress);
+    	                else        snprintf(head, sizeof(head), "[密码机]");
 
     	                // 两段分开上色：头用进度色，距离沿用原来 61~63 米变绿的规则
-    	                auto hs = ImGui::CalcTextSize(头, 0, 25);
-    	                auto ds = ImGui::CalcTextSize(距离文本.c_str(), 0, 25);
+    	                auto hs = ImGui::CalcTextSize(head, 0, 25);
+    	                auto ds = ImGui::CalcTextSize(dist_text.c_str(), 0, 25);
     	                float x0 = r_x - (hs.x + ds.x) / 2.0f;
-    	                Draw->AddText({x0, r_y}, 有进度 ? 进度颜色(进度) : ImColor(255,255,255,255), 头);
+    	                Draw->AddText({x0, r_y}, has_progress ? progress_color(progress) : ImColor(255,255,255,255), head);
     	                Draw->AddText({x0 + hs.x, r_y},
-    	                    (距离 >= 61 && 距离 <= 63) ? 绿色 : ImColor(255, 255, 255, 255),
-    	                    距离文本.c_str());
+    	                    (dist >= 61 && dist <= 63) ? color_green : ImColor(255, 255, 255, 255),
+    	                    dist_text.c_str());
 
     	                // 进度条画在文字上方；进度为 0 时没有意义，不画
-    	                if (有进度 && 进度 > 0.05f){
-    	                    const float 条宽 = 120.0f, 条高 = 10.0f;
-    	                    float bx = r_x - 条宽 / 2.0f, by = r_y - 条高 - 3.0f;
-    	                    Draw->AddRectFilled({bx, by}, {bx + 条宽 * (进度 / 100.0f), by + 条高}, 进度颜色(进度));
-    	                    Draw->AddRect({bx, by}, {bx + 条宽, by + 条高}, ImColor(255,255,255,255));
+    	                if (has_progress && progress > 0.05f){
+    	                    const float bar_w = 120.0f, bar_h = 10.0f;
+    	                    float bx = r_x - bar_w / 2.0f, by = r_y - bar_h - 3.0f;
+    	                    Draw->AddRectFilled({bx, by}, {bx + bar_w * (progress / 100.0f), by + bar_h}, progress_color(progress));
+    	                    Draw->AddRect({bx, by}, {bx + bar_w, by + bar_h}, ImColor(255,255,255,255));
     	                }
     	            }
     	        }
     	    }
     		}
 	
-		    if (show_draw_Prop&&data[i].阵营==4){
+		    if (show_draw_Prop&&data[i].camp==4){
                 // 自己身上的道具按距离剔除。必须只算**水平**距离:
                 // 道具是挂在角色骨骼上的(手/胸口)，挂点比角色原点(脚底)高一截，
                 // 实测 h55_pendant_glim(手电筒) 高度差固定 +0.73 米、水平只差 0.36 米。
                 // 三维距离因此恒有 0.7+ 米的底噪，亚米阈值永远不成立 —— 挂件类道具靠
                 // 三维距离**不可能**滤掉，跟站位无关，是结构性偏移。
-                // 另注: 全局的 距离 是 int(见文件头 `int 距离;`)，不到1米会被截断成0，
+                // 另注: 全局的 距离 是 int(见文件头 `int dist;`)，不到1米会被截断成0，
                 // 所以这里必须用浮点重算，不能直接拿 距离 比。
-                float 道具水平距离 = sqrt(pow(D.X - Z.X, 2) + pow(D.Y - Z.Y, 2)) / 距离比例;
+                float prop_hdist = sqrt(pow(D.X - Z.X, 2) + pow(D.Y - Z.Y, 2)) / dist_scale;
                 // 阈值 1.5 米：手电筒实测水平只差 0.36 米，但 1.0 米实战仍有漏网，
                 // 说明别的挂件(火箭/橄榄球等)挂点更靠外。代价是贴身队友手里的道具
                 // 也会被隐藏，1.5 米内的地面道具本来也在视野里，可以接受。
-                if (道具水平距离 >= 1.5f) {
-                    const char* propName = getprop(data[i].类名);
+                if (prop_hdist >= 1.5f) {
+                    const char* propName = getprop(data[i].class_name);
                     if (propName) {
                         std::string s = propName;
-                        s += std::to_string((int) 距离);
+                        s += std::to_string((int) dist);
                         s += " 米";
                         auto textSize = ImGui::CalcTextSize(s.c_str(), 0, 25);
                         Draw->AddText({r_x-(textSize.x/2),r_y}, ImColor(255,200,0,255), s.c_str());
@@ -1234,18 +1265,16 @@ void Draw_Main(ImDrawList *Draw){
                 }
             }
 
-            int zy;//=getbool(data[i].obj + 0xaa);
-            vm_readv(data[i].obj + 0xaa, &zy, 1);
-
+            // 这里原本读一次 +0xaa(zy)，唯一用到它的是下面那段已停用的相机深度启发式，已删。
             if (!ShouldSkipEntity(data[i])){
-                if (show_draw_Role&&strstr(data[i].类名, "chr") != NULL){
+                if (show_draw_Role&&strstr(data[i].class_name, "chr") != NULL){
                     std::string test;
                     test += " [";
-                    test += std::to_string((int) 距离);    
+                    test += std::to_string((int) dist);    
                     test += " 米]  0x";
                     test += objtext;    
                     test += " [类名] ";
-                    test += data[i].类名;
+                    test += data[i].class_name;
                     auto textSize = ImGui::CalcTextSize(test.c_str(), 0, 25);
                     Draw->AddText({r_x-(textSize.x/2),r_y}, ImColor(255,200,0,255), test.c_str());
                 }
@@ -1272,74 +1301,74 @@ void Draw_Main(ImDrawList *Draw){
                 // 全局 距离 是 int，不到 1 米会截断成 0，这里必须用浮点重算。
                 // 角色原点都在脚底，用三维距离即可(道具那边是挂点偏高才只能算水平距离)。
                 // 没有自身锚点时 Z 不可信，不做这层过滤。
-                float 离自身 = sqrtf(powf(D.X - Z.X, 2) + powf(D.Y - Z.Y, 2) + powf(D.Z - Z.Z, 2)) / 距离比例;
-                bool 贴身 = (自身 != 0) && 离自身 < 1.0f;
+                float dist_to_self = sqrtf(powf(D.X - Z.X, 2) + powf(D.Y - Z.Y, 2) + powf(D.Z - Z.Z, 2)) / dist_scale;
+                bool too_close = (self_obj != 0) && dist_to_self < 1.0f;
 
-                if (!模仿者绘制中 && !贴身 && (data[i].阵营==1||data[i].阵营==2)){
+                if (!copycat_drawing && !too_close && (data[i].camp==1||data[i].camp==2)){
                     s+=data[i].str;
                     auto textSize = ImGui::CalcTextSize(s.c_str(), 0, 25);
                     Draw->AddText({X1 + W/2-(textSize.x/2),Y1-45}, ImColor(255,200,0,255), s.c_str());
                     if (show_draw_Rect){
         			    if (IsGhostEntity(data[i]))
         			        ImGui::GetForegroundDrawList()->AddRect({X1, Y1},{X2, Y2}, BotBoneColor,3, 0,1.8);			        	        
-        			    else if (data[i].阵营==1)
+        			    else if (data[i].camp==1)
         			        ImGui::GetForegroundDrawList()->AddRect({X1, Y1},{X2, Y2}, BoneColor,3, 0,1.8f);
-        			    else if (data[i].阵营==2)
-        			        ImGui::GetForegroundDrawList()->AddRect({X1, Y1},{X2, Y2}, 绿色,3, 0,1.8f);
+        			    else if (data[i].camp==2)
+        			        ImGui::GetForegroundDrawList()->AddRect({X1, Y1},{X2, Y2}, color_green,3, 0,1.8f);
         			}
-                    float 下一行 = Y2 + 10;            // 距离、天赋、辅助特质依次往下排
-                    const float 行高 = ImGui::GetFontSize() + 2.0f;
+                    float next_y = Y2 + 10;            // 距离、天赋、辅助特质依次往下排
+                    const float line_h = ImGui::GetFontSize() + 2.0f;
                     if (show_draw_Distance){
-                        std::string 人物距离;
-                        人物距离 += std::to_string((int) 距离);
-                        人物距离 += " 米";
-                        auto textSize = ImGui::CalcTextSize(人物距离.c_str(), 0, 25);
-                        Draw->AddText({X1 + W/2-(textSize.x/2),下一行}, ImColor(255,200,0,255), 人物距离.c_str());
-                        下一行 += 行高;
+                        std::string dist_str;
+                        dist_str += std::to_string((int) dist);
+                        dist_str += " 米";
+                        auto textSize = ImGui::CalcTextSize(dist_str.c_str(), 0, 25);
+                        Draw->AddText({X1 + W/2-(textSize.x/2),next_y}, ImColor(255,200,0,255), dist_str.c_str());
+                        next_y += line_h;
                     }
 
                     // 天赋简称：求生者大心脏排最后、监管挽留排最后，格式化在 PyGenius.h 里
                     if (show_draw_Genius){
-                        天赋::信息 gi;
-                        if (天赋::查询(data[i].obj, D.X, D.Y, gi)){
-                            天赋::天赋行段 段;
-                            天赋::天赋分段(gi, 段);
-                            if (段.前[0] || 段.飞轮[0] || 段.后[0]){
+                        PyGenius::Info gi;
+                        if (PyGenius::lookup(data[i].obj, D.X, D.Y, gi)){
+                            PyGenius::GeniusLine seg;
+                            PyGenius::genius_segments(gi, seg);
+                            if (seg.pre[0] || seg.flywheel[0] || seg.post[0]){
                                 // 绝处逢生三态：没带=白 / 带了还没用=绿 / 带了已经用掉=灰。
                                 // 消耗标志是 unit.ability_used[102]，2026-09-22 实测**别人的也读得到**
                                 // (服务器会下发非本机玩家的消耗状态)，所以监管看四个人都准。
                                 ImColor c;
-                                switch (天赋::绝处状态(gi)) {
-                                    case 天赋::绝处_可用: c = 绿色; break;
-                                    case 天赋::绝处_已用: c = ImColor(140,140,140,255); break;
-                                    // 绝处_无(表完整且没带) 和 绝处_未知(表还没读全) 都画白色；
+                                switch (PyGenius::desperate_state(gi)) {
+                                    case PyGenius::DESPERATE_AVAILABLE: c = color_green; break;
+                                    case PyGenius::DESPERATE_USED: c = ImColor(140,140,140,255); break;
+                                    // DESPERATE_NONE(表完整且没带) 和 DESPERATE_UNKNOWN(表还没读全) 都画白色；
                                     // 后者的文本末尾带 "?"，靠它区分
-                                    case 天赋::绝处_未知:
+                                    case PyGenius::DESPERATE_UNKNOWN:
                                     default:              c = ImColor(255,255,255,255); break;
                                 }
                                 // 飞轮就绪时"飞轮"两个字画红，优先于上面的整行配色
-                                ImColor 飞轮色 = 段.飞轮就绪 ? 红色 : c;
-                                float w前 = ImGui::CalcTextSize(段.前, 0, 25).x;
-                                float w轮 = ImGui::CalcTextSize(段.飞轮, 0, 25).x;
-                                float w后 = ImGui::CalcTextSize(段.后, 0, 25).x;
-                                float tx = X1 + W/2 - (w前 + w轮 + w后)/2;
-                                if (段.前[0])   Draw->AddText({tx, 下一行}, c, 段.前);
-                                if (段.飞轮[0]) Draw->AddText({tx + w前, 下一行}, 飞轮色, 段.飞轮);
-                                if (段.后[0])   Draw->AddText({tx + w前 + w轮, 下一行}, c, 段.后);
-                                下一行 += 行高;
+                                ImColor flywheel_color = seg.flywheel_ready ? color_red : c;
+                                float w_pre = ImGui::CalcTextSize(seg.pre, 0, 25).x;
+                                float w_flywheel = ImGui::CalcTextSize(seg.flywheel, 0, 25).x;
+                                float w_post = ImGui::CalcTextSize(seg.post, 0, 25).x;
+                                float tx = X1 + W/2 - (w_pre + w_flywheel + w_post)/2;
+                                if (seg.pre[0])   Draw->AddText({tx, next_y}, c, seg.pre);
+                                if (seg.flywheel[0]) Draw->AddText({tx + w_pre, next_y}, flywheel_color, seg.flywheel);
+                                if (seg.post[0])   Draw->AddText({tx + w_pre + w_flywheel, next_y}, c, seg.post);
+                                next_y += line_h;
                             }
                             // 监管再单独一行写当前辅助特质 + 剩余冷却
                             // (带底牌会局中换特质，所以读的是实时值；冷却来自 skill_mgr，见 PyGenius.h)
                             // 梦之信徒(236)只有这一行：每个信徒有自己独立的闪现等特质冷却
-                            if ((gi.阵营 == 1 || gi.阵营 == 天赋::YIDHRA_PUPPET_UNIT_TYPE) && gi.辅助特质 != 0){
-                                char 特质行[48];
-                                天赋::特质行文本(gi, 天赋::特质名(gi.辅助特质), 特质行, sizeof(特质行));
-                                if (特质行[0]){
+                            if ((gi.camp == 1 || gi.camp == PyGenius::YIDHRA_PUPPET_UNIT_TYPE) && gi.support_trait != 0){
+                                char trait_line[48];
+                                PyGenius::trait_line_text(gi, PyGenius::trait_name(gi.support_trait), trait_line, sizeof(trait_line));
+                                if (trait_line[0]){
                                     // 就绪=绿，冷却中=白；读不到冷却时按白显示(只有名字)
-                                    ImColor cc = 天赋::已就绪(gi) ? 绿色 : ImColor(255,255,255,255);
-                                    auto ts2 = ImGui::CalcTextSize(特质行, 0, 25);
-                                    Draw->AddText({X1 + W/2-(ts2.x/2),下一行}, cc, 特质行);
-                                    下一行 += 行高;
+                                    ImColor cc = PyGenius::cd_ready(gi) ? color_green : ImColor(255,255,255,255);
+                                    auto ts2 = ImGui::CalcTextSize(trait_line, 0, 25);
+                                    Draw->AddText({X1 + W/2-(ts2.x/2),next_y}, cc, trait_line);
+                                    next_y += line_h;
                                 }
                             }
                         }
@@ -1355,13 +1384,13 @@ void Draw_Main(ImDrawList *Draw){
 	                
 	   //红夫人镜像                                   
 	    if (mirror&&redqueenmod){
-            if (getFloat(data[i].obj+0x1a0)==450&&data[i].阵营==2){
+            if (getFloat(data[i].obj+0x1a0)==450&&data[i].camp==2){
                 std::string ss;
                 // 镜线在 Draw_Main 开头算好(放下的镜子 / 准备阶段预览镜子二选一)，这里只做一次关于直线的对称
-                float 原X = D.X, 原Y = D.Y;
-                calculate_line_reflection(镜线X1, 镜线Y1, 镜线X2, 镜线Y2, 原X, 原Y, &D.X, &D.Y);
+                float orig_x = D.X, orig_y = D.Y;
+                calculate_line_reflection(mirror_line_x1, mirror_line_y1, mirror_line_x2, mirror_line_y2, orig_x, orig_y, &D.X, &D.Y);
                 camera = matrix[3] * D.X + matrix[7] * D.Z + matrix[11] * D.Y + matrix[15];
-                距离 = sqrt(pow(D.X - Z.X, 2) + pow(D.Y - Z.Y, 2) + pow(D.Z - Z.Z, 2)) / 距离比例;
+                dist = sqrt(pow(D.X - Z.X, 2) + pow(D.Y - Z.Y, 2) + pow(D.Z - Z.Z, 2)) / dist_scale;
         		r_x = px + (matrix[0] * D.X + matrix[4] * D.Z + matrix[8] * D.Y + matrix[12]) / camera * px;
                 r_y = py - (matrix[1] * D.X + matrix[5] * (D.Z+ 8.5) + matrix[9] * (D.Y) + matrix[13]) / camera * py;
                 r_w = py - (matrix[1] * D.X + matrix[5] * (D.Z+ 28.5) + matrix[9] * (D.Y) + matrix[13]) / camera * py;
@@ -1384,11 +1413,11 @@ void Draw_Main(ImDrawList *Draw){
     			    }
     			        
                     if (show_draw_Distance){
-                        std::string 镜像距离;
-                        镜像距离 += std::to_string((int) 距离);
-                        镜像距离 += " 米";
-                        auto textSize = ImGui::CalcTextSize(镜像距离.c_str(), 0, 25);
-                        Draw->AddText({X1 + W/2-(textSize.x/2),Y2+10}, BotBoneColor, 镜像距离.c_str());
+                        std::string mirror_dist_str;
+                        mirror_dist_str += std::to_string((int) dist);
+                        mirror_dist_str += " 米";
+                        auto textSize = ImGui::CalcTextSize(mirror_dist_str.c_str(), 0, 25);
+                        Draw->AddText({X1 + W/2-(textSize.x/2),Y2+10}, BotBoneColor, mirror_dist_str.c_str());
                     }
                         
                     if (show_draw_Line){
@@ -1492,9 +1521,9 @@ void Layout_tick_UI(bool *main_thread_flag) {
             ImGui::Text("内存占用: %zu KB", mem_kb);
 
         ImGui::Text("数据状态:");
-        if (状态 == 2)
+        if (read_state == 2)
             ImGui::TextColored(ImVec4(0.0f, 205.0f, 0.0f, 100.0f), "已获取到游戏数据");
-        else if (状态 == 1)
+        else if (read_state == 1)
             ImGui::TextColored(ImVec4(255.0f, 0.0f, 0.0f, 100.0f), "正在获取游戏数据");
 
         if (ImGui::CollapsingHeader("基础信息")) {
@@ -1504,15 +1533,16 @@ void Layout_tick_UI(bool *main_thread_flag) {
             ImGui::Text("矩阵地址:%lx", Matrix);
             ImGui::Text("数组地址:%lx", Arrayaddr);
             ImGui::Text("矩阵偏移:%lx", MatrixOffset);
-            ImGui::Text("相机偏移:%d", g_相机偏移);
+            ImGui::Text("相机偏移:%d", g_cam_offset);
             ImGui::Text("模块页数:%d", c);
             ImGui::Text("数组偏移:%lx", ArrayaddrOffset);
-            ImGui::Text("数据获取状态:%d", 数据获取状态);
-            ImGui::Text("监管者:%s", 监管者预知);
-            ImGui::Text("密码机进度:%s (已破译%d)", 密码机进度::状态文本(), 密码机进度::已破译数());
-            ImGui::Text("天赋:%s", 天赋::状态文本());
+            ImGui::Text("数据获取状态:%d", fetch_state);
+            ImGui::Text("监管者:%s", prophet_text);
+            ImGui::Text("Py根:%s", PyRoot::status_text());
+            ImGui::Text("密码机进度:%s (已破译%d)", PyProgress::status_text(), PyProgress::decoded_count());
+            ImGui::Text("天赋:%s", PyGenius::status_text());
             // 自身锚点：链路一旦失效这里会写明原因，绘制自动退回相机深度启发式
-            ImGui::Text("自身:%s", 本机::状态文本());
+            ImGui::Text("自身:%s", PySelf::status_text());
         }
 
         ImGui::SetNextItemOpen(true, ImGuiCond_Once);

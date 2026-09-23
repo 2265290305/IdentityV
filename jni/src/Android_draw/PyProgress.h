@@ -13,7 +13,7 @@
 //   C++ 注册给 Python 的属性，而是纯 Python 脚本里定义的。进度只存在于 CPython 堆上。
 //
 // 完整链路(每一跳都实测验证过，跨对局重验通过)：
-//   libbase + OFF_SYS_MODULES        -> sys.modules            (解释器状态是 .so 里的静态数据)
+//   PyRoot::g_modules_slot                 -> sys.modules            (在 .so 的 .PyRuntime 段里，见 PyRoot.h)
 //     按名字找 "game_kernel"          -> module
 //       module + 0x10                -> md_dict                (进程内稳定，不随对局变)
 //         按名字找 "unit_mgr"         -> UnitManager 实例       (每局重新分配)
@@ -54,23 +54,15 @@
 #include <cmath>
 #include <cstdio>
 #include <thread>
+#include <atomic>
 #include <unistd.h>
+#include "PyRoot.h"
 
-namespace 密码机进度 {
+namespace PyProgress {
 
-// ---- 模块相对偏移(2026-09-17 热更版实测)。热更后如果面板显示"链路失效"，从这里开始重验 ----
-static const uintptr_t OFF_SYS_MODULES = 0xA7029E8;   // *(libbase+此) = sys.modules
-static const uintptr_t OFF_FLOAT_TYPE  = 0xA0336F0;   // PyFloat_Type
-static const uintptr_t OFF_LONG_TYPE   = 0xA026498;   // PyLong_Type
-static const uintptr_t OFF_DICT_TYPE   = 0xA023BF0;   // PyDict_Type
+// sys.modules 与 dict/int/float/True/False 由 PyRoot.h 运行时找出，这里不再写死模块偏移
 
-// 布尔单例：CPython 的 True/False 是两个静态对象，地址永不移动。
-// 2026-09-22 实测 libbase+0xA0261A0 = True、+0xA0261C0 = False —— 这是读 ob_size/digit
-// 判出来的，**不是**按"False 在前"的直觉猜的(实际顺序正好相反，猜会全判错)。
-static const uintptr_t OFF_TRUE  = 0xA0261A0;
-static const uintptr_t OFF_FALSE = 0xA0261C0;
-
-static const int 最大机器数 = 16;
+static const int MAX_GENERATORS = 16;
 static const int GENERATOR_UNIT_TYPE = 3;
 
 // 大门。2026-09-22 实测 units_by_type[6] = DoorUnit，一局 2 个。
@@ -81,42 +73,46 @@ static const int GENERATOR_UNIT_TYPE = 3;
 // ！！大门进度只能走驱动读，不要试图用 adb/跨进程脚本验证 ！！
 // hack_process 每帧都被重新赋值成一个新的 float 对象。实测 PC 侧一次 fetch 约 0.4 秒，
 // 40 次取指针 40 次都已失效，命中率是 0；而驱动读"取指针->解引用->重读指针"是微秒级，
-// 对 16ms 的重赋值有三四个数量级余量。下面 读数值() 的五道闸(指针重读/refcount/类型/
+// 对 16ms 的重赋值有三四个数量级余量。下面 read_number() 的五道闸(指针重读/refcount/类型/
 // 0~100 值域/重试三次)一条都不能省 —— 尤其值域那条，垃圾值里 0.16 这种"看着合理"的
 // 也出现过，只靠指针稳定挡不住。
-static const int 最大大门数 = 4;
+static const int MAX_DOORS = 4;
 static const int DOOR_UNIT_TYPE = 6;
 
-struct 条目 { uint64_t 场景对象; float x, y, z; float 进度; };
-struct 大门条目 { uint64_t 场景对象; float 进度; bool 可开, 已开, 开启中; };
+struct Entry { uint64_t scene_obj; float x, y, z; float progress; };
+struct DoorEntry { uint64_t scene_obj; float progress; bool can_open, has_open, is_opening; };
 
 // 双缓冲发布：写线程填非活跃缓冲，填完再翻转，绘制线程永远读到一份完整的数据
-static 条目   g_缓冲[2][最大机器数];
-static volatile int g_计数[2] = {0, 0};
-static volatile int g_活跃 = 0;
+static Entry   g_buf[2][MAX_GENERATORS];
+static volatile int g_count[2] = {0, 0};
+// atomic 而不是 volatile：发布是"先填缓冲、再翻转下标"两步写，volatile 不阻止 ARM64 把它们
+// 乱序给到别的核心 —— 绘制线程可能先看到新下标、再看到旧内容，读到正在被填写的那块。
+// 读的一侧有地址依赖(下标决定读哪块)，硬件自会保序，所以只需要写侧这一道。
+// 默认 seq_cst 在 ARM64 上编成 stlr/ldar，不插 dmb。
+static std::atomic<int> g_active{0};
 
-// 大门跟密码机在同一次刷新里填、共用 g_活跃 的那一次翻转
-static 大门条目 g_门缓冲[2][最大大门数];
-static volatile int g_门计数[2] = {0, 0};
+// 大门跟密码机在同一次刷新里填、共用 g_active 的那一次翻转
+static DoorEntry g_door_buf[2][MAX_DOORS];
+static volatile int g_door_count[2] = {0, 0};
 
 static uintptr_t g_libbase = 0;
-static uint64_t  g_浮点类型 = 0, g_整数类型 = 0, g_字典类型 = 0;
-static uint64_t  g_真 = 0, g_假 = 0;             // True/False 两个静态单例
-static uint64_t  g_模块字典 = 0;                 // game_kernel 的 md_dict，进程内稳定
+static uint64_t  g_float_type = 0, g_int_type = 0, g_dict_type = 0;
+static uint64_t  g_true = 0, g_false = 0;             // True/False 两个静态单例
+static uint64_t  g_module_dict = 0;                 // game_kernel 的 md_dict，进程内稳定
 static int64_t   g_i_unit_mgr = -1, g_i_ubt = -1, g_i_fix = -1, g_i_pos = -1, g_i_model = -1;
 // 大门自己的一套序号缓存：DoorUnit 和 GeneratorUnit 是两个类，插入顺序不同，
 // 序号不能共用(共用的话每个单位都要重扫一遍，白白浪费)
-static int64_t   g_i_hack = -1, g_i_门model = -1, g_i_可开 = -1, g_i_已开 = -1, g_i_开启中 = -1;
-static volatile bool g_可用 = false;
-static volatile int  g_连续失败 = 0;
-static char g_状态[96] = "未启动";
+static int64_t   g_i_hack = -1, g_i_door_model = -1, g_i_can_open = -1, g_i_has_open = -1, g_i_is_opening = -1;
+static volatile bool g_available = false;
+static volatile int  g_fail_streak = 0;
+static char g_status[96] = "未启动";
 
-static inline bool 是对象(uint64_t p) { return p > 0x7000000000ULL && p < 0x8000000000ULL; }
+static inline bool is_obj(uint64_t p) { return p > 0x7000000000ULL && p < 0x8000000000ULL; }
 
 // PyASCIIObject: 长度在 +0x10，紧凑 ASCII 数据在 +0x30
-static bool 字符串等于(uint64_t s, const char *want)
+static bool str_equals(uint64_t s, const char *want)
 {
-    if (!是对象(s)) return false;
+    if (!is_obj(s)) return false;
     int64_t len = 0;
     if (!vm_readv(s + 0x10, &len, 8)) return false;
     size_t n = strlen(want);
@@ -126,52 +122,104 @@ static bool 字符串等于(uint64_t s, const char *want)
     return memcmp(buf, want, n) == 0;
 }
 
-struct 字典 { uint64_t 条目起; int 步长; int64_t 条数; };
+struct Dict { uint64_t entries; int stride; int64_t n_entries; };
 
-static bool 取字典(uint64_t d, 字典 &out)
+static bool read_dict(uint64_t d, Dict &out)
 {
-    if (!是对象(d)) return false;
+    if (!is_obj(d)) return false;
     uint64_t keys = getPtr64(d + 0x20);           // ma_keys
-    if (!是对象(keys)) return false;
+    if (!is_obj(keys)) return false;
     uint8_t hdr[32];
     if (!vm_readv(keys, hdr, 32)) return false;
     uint8_t idxb = hdr[9];                        // dk_log2_index_bytes
     uint8_t kind = hdr[10];                       // dk_kind: 0=通用(带hash,24字节) 其它=全unicode(16字节)
     int64_t nent = 0; memcpy(&nent, hdr + 24, 8); // dk_nentries
     if (idxb > 30 || nent < 0 || nent > (1 << 22)) return false;
-    out.条目起 = keys + 32 + ((uint64_t)1 << idxb);
-    out.步长   = (kind == 0) ? 24 : 16;
-    out.条数   = nent;
+    out.entries = keys + 32 + ((uint64_t)1 << idxb);
+    out.stride   = (kind == 0) ? 24 : 16;
+    out.n_entries   = nent;
     return true;
 }
 
-static inline uint64_t 键槽(const 字典 &k, int64_t i) { return k.条目起 + i * k.步长 + (k.步长 == 24 ? 8 : 0); }
-static inline uint64_t 值槽(const 字典 &k, int64_t i) { return k.条目起 + i * k.步长 + (k.步长 == 24 ? 16 : 8); }
+static inline uint64_t key_slot(const Dict &k, int64_t i) { return k.entries + i * k.stride + (k.stride == 24 ? 8 : 0); }
+static inline uint64_t value_slot(const Dict &k, int64_t i) { return k.entries + i * k.stride + (k.stride == 24 ? 16 : 8); }
 
 // 先试缓存的序号并用名字校验，对不上再全扫。返回序号，失败返回 -1
-static int64_t 查名(uint64_t d, const char *name, int64_t hint)
+// ---- 字典查找的两项优化(2026-09-23) ----
+// 原来每比一个键要 3 次驱动读(取键指针 + 读长度 + 读内容)，全扫上千条的实例字典就是几千次读。
+//   a) 整块读条目：entries 是连续内存，一次 vm_readv 读完(1300 条 * 24 字节 = 31KB)，
+//      之后在本地取键指针，省掉"每条一次取指针"。
+//   b) 驻留键指针：CPython 会驻留标识符形式的属性名，所以同一个属性名在进程里就是同一个
+//      字符串对象。第一次按名字找到后记下键对象地址，以后只比指针，连字符串都不用读。
+//      这个假设不成立时会自动退回按名字比较，只是慢一点，不会读错。
+// 效果：命中缓存的校验从 3 次读降到 1 次；全扫从几千次降到 1 次(整块) + 本地比较。
+static uint8_t g_entry_block[48 * 1024];
+struct InternedName { const char *name; uint64_t key_obj; };
+static InternedName g_interned[32];
+static int g_interned_n = 0;
+
+static uint64_t interned_of(const char *name)
 {
-    字典 k;
-    if (!取字典(d, k)) return -1;
-    if (hint >= 0 && hint < k.条数 && 字符串等于(getPtr64(键槽(k, hint)), name)) return hint;
-    for (int64_t i = 0; i < k.条数; i++)
-        if (字符串等于(getPtr64(键槽(k, i)), name)) return i;
+    for (int i = 0; i < g_interned_n; i++)
+        if (strcmp(g_interned[i].name, name) == 0) return g_interned[i].key_obj;
+    return 0;
+}
+
+static void remember_interned(const char *name, uint64_t kp)
+{
+    for (int i = 0; i < g_interned_n; i++)
+        if (strcmp(g_interned[i].name, name) == 0) { g_interned[i].key_obj = kp; return; }
+    if (g_interned_n < (int)(sizeof(g_interned) / sizeof(g_interned[0]))) {
+        g_interned[g_interned_n].name = name;          // 调用方传的都是字符串常量，生命周期同进程
+        g_interned[g_interned_n].key_obj = kp;
+        g_interned_n++;
+    }
+}
+
+static int64_t find_key(uint64_t d, const char *name, int64_t hint)
+{
+    Dict k;
+    if (!read_dict(d, k)) return -1;
+    const uint64_t want = interned_of(name);
+    if (hint >= 0 && hint < k.n_entries) {
+        uint64_t kp = getPtr64(key_slot(k, hint));
+        if (want && kp == want) return hint;                        // 命中缓存：只花 1 次读
+        if (str_equals(kp, name)) { remember_interned(name, kp); return hint; }
+    }
+    size_t bytes = (size_t)k.n_entries * k.stride;
+    int key_off = (k.stride == 24) ? 8 : 0;
+    if (bytes > 0 && bytes <= sizeof(g_entry_block) && vm_readv(k.entries, g_entry_block, bytes)) {
+        for (int pass = 0; pass < 2; pass++) {
+            if (pass == 0 && !want) continue;                       // 还不知道键地址，直接进第二遍
+            for (int64_t i = 0; i < k.n_entries; i++) {
+                uint64_t kp = 0;
+                memcpy(&kp, g_entry_block + (size_t)i * k.stride + key_off, 8);
+                kp &= 0x00FFFFFFFFFFFFFFULL;
+                if (pass == 0) { if (kp == want) return i; }
+                else if (str_equals(kp, name)) { remember_interned(name, kp); return i; }
+            }
+        }
+        return -1;
+    }
+    // 整块读失败(条目跨到换出的页等)：退回逐条读，行为和以前完全一样
+    for (int64_t i = 0; i < k.n_entries; i++)
+        if (str_equals(getPtr64(key_slot(k, i)), name)) return i;
     return -1;
 }
 
-static uint64_t 取属性(uint64_t d, int64_t idx)
+static uint64_t get_attr(uint64_t d, int64_t idx)
 {
-    字典 k;
-    if (!取字典(d, k) || idx < 0 || idx >= k.条数) return 0;
-    return getPtr64(值槽(k, idx));
+    Dict k;
+    if (!read_dict(d, k) || idx < 0 || idx >= k.n_entries) return 0;
+    return getPtr64(value_slot(k, idx));
 }
 
 // 读一个 int/float 属性。带防竞态校验，见文件头第 3 条
-static bool 读数值(uint64_t slot, float &out)
+static bool read_number(uint64_t slot, float &out)
 {
     for (int t = 0; t < 3; t++) {
         uint64_t vp = getPtr64(slot);
-        if (!是对象(vp)) continue;
+        if (!is_obj(vp)) continue;
         uint8_t b[32];
         if (!vm_readv(vp, b, 32)) continue;
         if (getPtr64(slot) != vp) continue;       // 解引用期间指针变了 -> 对象可能已被释放复用
@@ -179,9 +227,9 @@ static bool 读数值(uint64_t slot, float &out)
         uint64_t tp = 0; memcpy(&tp, b + 8, 8); tp &= 0x00FFFFFFFFFFFFFFULL;
         if (rc <= 0) continue;                    // refcount 0 = 已释放
         double v;
-        if (tp == g_浮点类型) {
+        if (tp == g_float_type) {
             memcpy(&v, b + 16, 8);
-        } else if (tp == g_整数类型) {            // CPython 3.11: +0x10 是 ob_size, +0x18 是第一个 digit
+        } else if (tp == g_int_type) {            // CPython 3.11: +0x10 是 ob_size, +0x18 是第一个 digit
             int64_t sz = 0; memcpy(&sz, b + 16, 8);
             uint32_t dg = 0; memcpy(&dg, b + 24, 4);
             v = (sz == 0) ? 0.0 : (double)dg;
@@ -198,12 +246,12 @@ static bool 读数值(uint64_t slot, float &out)
 
 // 读一个 bool 属性。先比两个静态单例(最稳)，比不上再按 PyLong 布局的 ob_size/digit 退化解，
 // 这样热更挪了单例地址也还能用
-static bool 读布尔(uint64_t slot, bool &out)
+static bool read_bool(uint64_t slot, bool &out)
 {
     uint64_t vp = getPtr64(slot);
-    if (!是对象(vp)) return false;
-    if (vp == g_真) { out = true;  return true; }
-    if (vp == g_假) { out = false; return true; }
+    if (!is_obj(vp)) return false;
+    if (vp == g_true) { out = true;  return true; }
+    if (vp == g_false) { out = false; return true; }
     uint8_t b[32];
     if (!vm_readv(vp, b, 32)) return false;
     int64_t rc = 0; memcpy(&rc, b, 8);
@@ -214,278 +262,285 @@ static bool 读布尔(uint64_t slot, bool &out)
     return true;
 }
 
-static bool 解析模块()
+static bool resolve_module()
 {
-    uint64_t sm = getPtr64(g_libbase + OFF_SYS_MODULES);
-    if (!是对象(sm)) { snprintf(g_状态, sizeof(g_状态), "sys.modules 取不到"); return false; }
-    if (getPtr64(sm + 8) != g_字典类型) { snprintf(g_状态, sizeof(g_状态), "sys.modules 不是dict(偏移已失效)"); return false; }
-    int64_t i = 查名(sm, "game_kernel", -1);
-    if (i < 0) { snprintf(g_状态, sizeof(g_状态), "找不到 game_kernel 模块"); return false; }
-    uint64_t mod = 取属性(sm, i);
-    if (!是对象(mod)) { snprintf(g_状态, sizeof(g_状态), "game_kernel 模块对象无效"); return false; }
-    g_模块字典 = getPtr64(mod + 0x10);            // module.md_dict
-    if (!是对象(g_模块字典)) { g_模块字典 = 0; snprintf(g_状态, sizeof(g_状态), "md_dict 无效"); return false; }
+    uint64_t sm = getPtr64(PyRoot::g_modules_slot);
+    if (!is_obj(sm)) { snprintf(g_status, sizeof(g_status), "sys.modules 取不到"); return false; }
+    if (getPtr64(sm + 8) != g_dict_type) { snprintf(g_status, sizeof(g_status), "sys.modules 不是dict(偏移已失效)"); return false; }
+    int64_t i = find_key(sm, "game_kernel", -1);
+    if (i < 0) { snprintf(g_status, sizeof(g_status), "找不到 game_kernel 模块"); return false; }
+    uint64_t mod = get_attr(sm, i);
+    if (!is_obj(mod)) { snprintf(g_status, sizeof(g_status), "game_kernel 模块对象无效"); return false; }
+    g_module_dict = getPtr64(mod + 0x10);            // module.md_dict
+    if (!is_obj(g_module_dict)) { g_module_dict = 0; snprintf(g_status, sizeof(g_status), "md_dict 无效"); return false; }
     return true;
 }
 
 // 这个类的某个属性序号：先用缓存的并按名字校验，不对就全扫重找
-static int64_t 校准序号(uint64_t d, const 字典 &dk, int64_t 缓存, const char *name)
+static int64_t resolve_index(uint64_t d, const Dict &dk, int64_t cached, const char *name)
 {
-    if (缓存 >= 0 && 缓存 < dk.条数 && 字符串等于(getPtr64(键槽(dk, 缓存)), name)) return 缓存;
-    return 查名(d, name, -1);
+    if (cached >= 0 && cached < dk.n_entries) {
+        uint64_t kp = getPtr64(key_slot(dk, cached));
+        uint64_t want = interned_of(name);
+        if (want && kp == want) return cached;                      // 驻留键指针：校验只要 1 次读
+        if (str_equals(kp, name)) { remember_interned(name, kp); return cached; }
+    }
+    return find_key(d, name, -1);
 }
 
 // units_by_type 是 dict(int -> list)，按 int 键取出那条 list
-static uint64_t 取分类表(uint64_t ubt, int 类型)
+static uint64_t get_type_list(uint64_t ubt, int type)
 {
-    字典 k;
-    if (!取字典(ubt, k)) return 0;
-    for (int64_t i = 0; i < k.条数; i++) {
-        uint64_t kp = getPtr64(键槽(k, i));
-        if (!是对象(kp) || getPtr64(kp + 8) != g_整数类型) continue;
+    Dict k;
+    if (!read_dict(ubt, k)) return 0;
+    for (int64_t i = 0; i < k.n_entries; i++) {
+        uint64_t kp = getPtr64(key_slot(k, i));
+        if (!is_obj(kp) || getPtr64(kp + 8) != g_int_type) continue;
         int64_t sz = 0; uint32_t dg = 0;
         vm_readv(kp + 16, &sz, 8);
         vm_readv(kp + 24, &dg, 4);
-        if (sz == 1 && (int)dg == 类型) return getPtr64(值槽(k, i));
+        if (sz == 1 && (int)dg == type) return getPtr64(value_slot(k, i));
     }
     return 0;
 }
 
 // 大门：units_by_type[6]。读不到不算整轮失败 —— 门和密码机互不影响
-static void 收大门(uint64_t ubt, int 写)
+static void collect_doors(uint64_t ubt, int write_idx)
 {
-    g_门计数[写] = 0;
-    uint64_t 列表 = 取分类表(ubt, DOOR_UNIT_TYPE);
-    if (!是对象(列表)) return;
+    g_door_count[write_idx] = 0;
+    uint64_t lst = get_type_list(ubt, DOOR_UNIT_TYPE);
+    if (!is_obj(lst)) return;
 
     int64_t n = 0;
-    vm_readv(列表 + 0x10, &n, 8);                 // ob_size
-    uint64_t items = getPtr64(列表 + 0x18);       // ob_item
-    if (n <= 0 || n > 16 || !是对象(items)) return;
-    if (n > 最大大门数) n = 最大大门数;
+    vm_readv(lst + 0x10, &n, 8);                 // ob_size
+    uint64_t items = getPtr64(lst + 0x18);       // ob_item
+    if (n <= 0 || n > 16 || !is_obj(items)) return;
+    if (n > MAX_DOORS) n = MAX_DOORS;
 
-    int 个数 = 0;
+    int count = 0;
     for (int64_t i = 0; i < n; i++) {
         uint64_t inst = getPtr64(items + i * 8);
-        if (!是对象(inst)) continue;
+        if (!is_obj(inst)) continue;
         uint64_t d = getPtr64(inst - 0x18);
-        字典 dk;
-        if (!取字典(d, dk)) continue;
+        Dict dk;
+        if (!read_dict(d, dk)) continue;
 
-        g_i_hack    = 校准序号(d, dk, g_i_hack,    "hack_process");
-        g_i_门model = 校准序号(d, dk, g_i_门model, "model");
-        g_i_可开    = 校准序号(d, dk, g_i_可开,    "can_open");
-        g_i_已开    = 校准序号(d, dk, g_i_已开,    "has_open");
-        g_i_开启中  = 校准序号(d, dk, g_i_开启中,  "is_opening");
+        g_i_hack    = resolve_index(d, dk, g_i_hack,    "hack_process");
+        g_i_door_model = resolve_index(d, dk, g_i_door_model, "model");
+        g_i_can_open    = resolve_index(d, dk, g_i_can_open,    "can_open");
+        g_i_has_open    = resolve_index(d, dk, g_i_has_open,    "has_open");
+        g_i_is_opening  = resolve_index(d, dk, g_i_is_opening,  "is_opening");
         if (g_i_hack < 0) continue;
 
-        float 进度 = 0.f;
-        if (!读数值(值槽(dk, g_i_hack), 进度)) continue;   // 读不稳就整扇门跳过，不发布垃圾
+        float progress = 0.f;
+        if (!read_number(value_slot(dk, g_i_hack), progress)) continue;   // 读不稳就整扇门跳过，不发布垃圾
 
         // 配对只能用 model 的指针身份。大门**不能**走场景侧判据：
         // 实测两扇门的场景类名还不一样(dm65_scene_prop_30 / dm65_scene_wooddoor01a)，
         // 而且两扇的 +0x240 都是 0 —— 那条"最可靠的存在性判据"在大门上直接失效。
-        uint64_t 场景 = 0;
-        if (g_i_门model >= 0) {
-            uint64_t mo = getPtr64(值槽(dk, g_i_门model));
-            if (是对象(mo)) {
+        uint64_t scene = 0;
+        if (g_i_door_model >= 0) {
+            uint64_t mo = getPtr64(value_slot(dk, g_i_door_model));
+            if (is_obj(mo)) {
                 uint64_t sp = getPtr64(mo + 0x20);
-                if (是对象(sp)) 场景 = sp;
+                if (is_obj(sp)) scene = sp;
             }
         }
-        if (场景 == 0) continue;                  // 没有身份就画不到屏幕上，收了也没用
+        if (scene == 0) continue;                  // 没有身份就画不到屏幕上，收了也没用
 
-        bool 可开 = false, 已开 = false, 开中 = false;
-        if (g_i_可开   >= 0) 读布尔(值槽(dk, g_i_可开),   可开);
-        if (g_i_已开   >= 0) 读布尔(值槽(dk, g_i_已开),   已开);
-        if (g_i_开启中 >= 0) 读布尔(值槽(dk, g_i_开启中), 开中);
+        bool can_open = false, has_open = false, opening = false;
+        if (g_i_can_open   >= 0) read_bool(value_slot(dk, g_i_can_open),   can_open);
+        if (g_i_has_open   >= 0) read_bool(value_slot(dk, g_i_has_open),   has_open);
+        if (g_i_is_opening >= 0) read_bool(value_slot(dk, g_i_is_opening), opening);
 
-        g_门缓冲[写][个数].场景对象 = 场景;
-        g_门缓冲[写][个数].进度     = 进度;
-        g_门缓冲[写][个数].可开     = 可开;
-        g_门缓冲[写][个数].已开     = 已开;
-        g_门缓冲[写][个数].开启中   = 开中;
-        个数++;
+        g_door_buf[write_idx][count].scene_obj = scene;
+        g_door_buf[write_idx][count].progress     = progress;
+        g_door_buf[write_idx][count].can_open     = can_open;
+        g_door_buf[write_idx][count].has_open     = has_open;
+        g_door_buf[write_idx][count].is_opening   = opening;
+        count++;
     }
-    g_门计数[写] = 个数;
+    g_door_count[write_idx] = count;
 }
 
-static bool 尝试刷新()
+static bool try_refresh()
 {
-    if (g_模块字典 == 0 && !解析模块()) return false;
+    if (g_module_dict == 0 && !resolve_module()) return false;
 
-    g_i_unit_mgr = 查名(g_模块字典, "unit_mgr", g_i_unit_mgr);
-    uint64_t um = (g_i_unit_mgr >= 0) ? 取属性(g_模块字典, g_i_unit_mgr) : 0;
-    if (!是对象(um)) { snprintf(g_状态, sizeof(g_状态), "unit_mgr 无效(未在对局中?)"); return false; }
+    g_i_unit_mgr = find_key(g_module_dict, "unit_mgr", g_i_unit_mgr);
+    uint64_t um = (g_i_unit_mgr >= 0) ? get_attr(g_module_dict, g_i_unit_mgr) : 0;
+    if (!is_obj(um)) { snprintf(g_status, sizeof(g_status), "unit_mgr 无效(未在对局中?)"); return false; }
 
     uint64_t ud = getPtr64(um - 0x18);            // managed-dict 预头
-    g_i_ubt = 查名(ud, "units_by_type", g_i_ubt);
-    uint64_t ubt = (g_i_ubt >= 0) ? 取属性(ud, g_i_ubt) : 0;
-    if (!是对象(ubt)) { snprintf(g_状态, sizeof(g_状态), "units_by_type 无效"); return false; }
+    g_i_ubt = find_key(ud, "units_by_type", g_i_ubt);
+    uint64_t ubt = (g_i_ubt >= 0) ? get_attr(ud, g_i_ubt) : 0;
+    if (!is_obj(ubt)) { snprintf(g_status, sizeof(g_status), "units_by_type 无效"); return false; }
 
     // 大门先收：放在密码机那几个 return false 之前，免得"没有密码机列表"把门也带下水
-    int 写 = 1 - g_活跃;
-    收大门(ubt, 写);
+    int write_idx = 1 - g_active;
+    collect_doors(ubt, write_idx);
 
     // 在 int->list 的表里找键 3
-    字典 k;
-    if (!取字典(ubt, k)) { snprintf(g_状态, sizeof(g_状态), "units_by_type 结构异常"); return false; }
-    uint64_t 列表 = 0;
-    for (int64_t i = 0; i < k.条数; i++) {
-        uint64_t kp = getPtr64(键槽(k, i));
-        if (!是对象(kp) || getPtr64(kp + 8) != g_整数类型) continue;
+    Dict k;
+    if (!read_dict(ubt, k)) { snprintf(g_status, sizeof(g_status), "units_by_type 结构异常"); return false; }
+    uint64_t lst = 0;
+    for (int64_t i = 0; i < k.n_entries; i++) {
+        uint64_t kp = getPtr64(key_slot(k, i));
+        if (!is_obj(kp) || getPtr64(kp + 8) != g_int_type) continue;
         int64_t sz = 0; uint32_t dg = 0;
         vm_readv(kp + 16, &sz, 8);
         vm_readv(kp + 24, &dg, 4);
-        if (sz == 1 && (int)dg == GENERATOR_UNIT_TYPE) { 列表 = getPtr64(值槽(k, i)); break; }
+        if (sz == 1 && (int)dg == GENERATOR_UNIT_TYPE) { lst = getPtr64(value_slot(k, i)); break; }
     }
-    if (!是对象(列表)) { snprintf(g_状态, sizeof(g_状态), "没有密码机列表"); return false; }
+    if (!is_obj(lst)) { snprintf(g_status, sizeof(g_status), "没有密码机列表"); return false; }
 
     int64_t n = 0;
-    vm_readv(列表 + 0x10, &n, 8);                 // ob_size
-    uint64_t items = getPtr64(列表 + 0x18);       // ob_item
-    if (n <= 0 || n > 64 || !是对象(items)) { snprintf(g_状态, sizeof(g_状态), "密码机列表异常"); return false; }
-    if (n > 最大机器数) n = 最大机器数;
+    vm_readv(lst + 0x10, &n, 8);                 // ob_size
+    uint64_t items = getPtr64(lst + 0x18);       // ob_item
+    if (n <= 0 || n > 64 || !is_obj(items)) { snprintf(g_status, sizeof(g_status), "密码机列表异常"); return false; }
+    if (n > MAX_GENERATORS) n = MAX_GENERATORS;
 
-    int 个数 = 0;                                  // 写缓冲下标在上面收大门时已经取好
+    int count = 0;                                  // 写缓冲下标在上面收大门时已经取好
     for (int64_t i = 0; i < n; i++) {
         uint64_t inst = getPtr64(items + i * 8);
-        if (!是对象(inst)) continue;
+        if (!is_obj(inst)) continue;
         uint64_t d = getPtr64(inst - 0x18);
-        字典 dk;
-        if (!取字典(d, dk)) continue;
+        Dict dk;
+        if (!read_dict(d, dk)) continue;
 
-        g_i_fix   = 校准序号(d, dk, g_i_fix,   "fix_process");
-        g_i_model = 校准序号(d, dk, g_i_model, "model");
-        g_i_pos   = 校准序号(d, dk, g_i_pos,   "position");
+        g_i_fix   = resolve_index(d, dk, g_i_fix,   "fix_process");
+        g_i_model = resolve_index(d, dk, g_i_model, "model");
+        g_i_pos   = resolve_index(d, dk, g_i_pos,   "position");
         if (g_i_fix < 0) continue;
 
-        float 进度 = 0.f;
-        if (!读数值(值槽(dk, g_i_fix), 进度)) continue;
+        float progress = 0.f;
+        if (!read_number(value_slot(dk, g_i_fix), progress)) continue;
 
-        uint64_t 场景 = 0;
+        uint64_t scene = 0;
         if (g_i_model >= 0) {
-            uint64_t mo = getPtr64(值槽(dk, g_i_model));
-            if (是对象(mo)) {
+            uint64_t mo = getPtr64(value_slot(dk, g_i_model));
+            if (is_obj(mo)) {
                 uint64_t sp = getPtr64(mo + 0x20);
-                if (是对象(sp)) 场景 = sp;
+                if (is_obj(sp)) scene = sp;
             }
         }
         float xyz[3] = {0, 0, 0};
         if (g_i_pos >= 0) {
-            uint64_t pos = getPtr64(值槽(dk, g_i_pos));
-            if (是对象(pos)) vm_readv(pos + 0x10, xyz, 12);   // +0x10/+0x14/+0x18 = X/高度/Y
+            uint64_t pos = getPtr64(value_slot(dk, g_i_pos));
+            if (is_obj(pos)) vm_readv(pos + 0x10, xyz, 12);   // +0x10/+0x14/+0x18 = X/高度/Y
         }
-        g_缓冲[写][个数].场景对象 = 场景;
-        g_缓冲[写][个数].x = xyz[0];
-        g_缓冲[写][个数].z = xyz[1];
-        g_缓冲[写][个数].y = xyz[2];
-        g_缓冲[写][个数].进度 = 进度;
-        个数++;
+        g_buf[write_idx][count].scene_obj = scene;
+        g_buf[write_idx][count].x = xyz[0];
+        g_buf[write_idx][count].z = xyz[1];
+        g_buf[write_idx][count].y = xyz[2];
+        g_buf[write_idx][count].progress = progress;
+        count++;
     }
 
-    if (个数 == 0) { snprintf(g_状态, sizeof(g_状态), "一台也没读出"); return false; }
-    g_计数[写] = 个数;
-    g_活跃 = 写;                                   // 填完再翻转，绘制线程永远看到完整的一份
-    snprintf(g_状态, sizeof(g_状态), "正常 %d 台 门%d", 个数, g_门计数[写]);
+    if (count == 0) { snprintf(g_status, sizeof(g_status), "一台也没读出"); return false; }
+    g_count[write_idx] = count;
+    g_active = write_idx;                                   // 填完再翻转，绘制线程永远看到完整的一份
+    snprintf(g_status, sizeof(g_status), "正常 %d 台 门%d", count, g_door_count[write_idx]);
     return true;
 }
 
-static void 刷新一次()
+static void refresh_once()
 {
     if (g_libbase == 0) return;
-    if (尝试刷新()) {
-        g_可用 = true;
-        g_连续失败 = 0;
+    if (!PyRoot::ensure()) {
+        g_available = false;
+        snprintf(g_status, sizeof(g_status), "%s", PyRoot::status_text());
         return;
     }
-    g_可用 = false;
-    if (++g_连续失败 >= 8) {                       // 连续失败就把缓存的序号全部作废，下一轮重新按名字找
-        g_模块字典 = 0;
+    g_float_type = PyRoot::g_float_type; g_int_type = PyRoot::g_int_type; g_dict_type = PyRoot::g_dict_type;
+    g_true = PyRoot::g_true; g_false = PyRoot::g_false;
+    if (try_refresh()) {
+        g_available = true;
+        g_fail_streak = 0;
+        return;
+    }
+    g_available = false;
+    if (++g_fail_streak >= 8) {                       // 连续失败就把缓存的序号全部作废，下一轮重新按名字找
+        g_module_dict = 0;
         g_i_unit_mgr = g_i_ubt = g_i_fix = g_i_pos = g_i_model = -1;
-        g_i_hack = g_i_门model = g_i_可开 = g_i_已开 = g_i_开启中 = -1;
-        g_连续失败 = 0;
+        g_i_hack = g_i_door_model = g_i_can_open = g_i_has_open = g_i_is_opening = -1;
+        g_fail_streak = 0;
     }
 }
 
 // 一轮大约几十到两百次驱动读(微秒级)，100ms 一轮的开销可以忽略，换来 10Hz 的刷新
-static const int 刷新间隔毫秒 = 100;
+static const int REFRESH_INTERVAL_MS = 100;
 
-static void 线程体()
+static void thread_main()
 {
     while (true) {
-        刷新一次();
-        usleep(刷新间隔毫秒 * 1000);
+        refresh_once();
+        usleep(REFRESH_INTERVAL_MS * 1000);
     }
 }
 
-static void 启动(uintptr_t libbase)
+static void start(uintptr_t libbase)
 {
     if (g_libbase != 0) return;
     g_libbase   = libbase;
-    g_浮点类型 = libbase + OFF_FLOAT_TYPE;
-    g_整数类型 = libbase + OFF_LONG_TYPE;
-    g_字典类型 = libbase + OFF_DICT_TYPE;
-    g_真       = libbase + OFF_TRUE;
-    g_假       = libbase + OFF_FALSE;
-    snprintf(g_状态, sizeof(g_状态), "启动中");
-    std::thread(线程体).detach();
+    snprintf(g_status, sizeof(g_status), "启动中");
+    std::thread(thread_main).detach();
     printf("[密码机进度] 已启动 libbase=0x%lx\n", (unsigned long)libbase);
     fflush(stdout);
 }
 
 // ---------------- 给绘制侧用的只读接口 ----------------
 
-static inline bool 可用() { return g_可用; }
-static inline const char *状态文本() { return g_状态; }
+static inline bool available() { return g_available; }
+static inline const char *status_text() { return g_status; }
 
 // 把场景对象配到对应的 GeneratorUnit。
 // 首选指针身份(model+0x20 就是场景对象本身)；model 为空时才退回坐标近邻。
 // 坐标兜底不能单独用: 实测一局 7 台里有 4 台的 position 读不出，那几台会一直配不上。
-static bool 查询(uintptr_t obj, float x, float y, float &进度)
+static bool lookup(uintptr_t obj, float x, float y, float &progress)
 {
-    if (!g_可用) return false;
-    int b = g_活跃, n = g_计数[b];
+    if (!g_available) return false;
+    int b = g_active, n = g_count[b];
     for (int i = 0; i < n; i++) {
-        if (g_缓冲[b][i].场景对象 == (uint64_t)obj) { 进度 = g_缓冲[b][i].进度; return true; }
+        if (g_buf[b][i].scene_obj == (uint64_t)obj) { progress = g_buf[b][i].progress; return true; }
     }
-    int 最近 = -1; float 最小 = 2.0f;
+    int nearest = -1; float min_dist = 2.0f;
     for (int i = 0; i < n; i++) {
-        if (g_缓冲[b][i].场景对象 != 0) continue;                        // 有身份的已经在上面比过了
-        if (g_缓冲[b][i].x == 0.f && g_缓冲[b][i].y == 0.f) continue;    // 坐标没写入的跳过，避免误配
-        float d = fabsf(g_缓冲[b][i].x - x) + fabsf(g_缓冲[b][i].y - y);
-        if (d < 最小) { 最小 = d; 最近 = i; }
+        if (g_buf[b][i].scene_obj != 0) continue;                        // 有身份的已经在上面比过了
+        if (g_buf[b][i].x == 0.f && g_buf[b][i].y == 0.f) continue;    // 坐标没写入的跳过，避免误配
+        float d = fabsf(g_buf[b][i].x - x) + fabsf(g_buf[b][i].y - y);
+        if (d < min_dist) { min_dist = d; nearest = i; }
     }
-    if (最近 < 0) return false;
-    进度 = g_缓冲[b][最近].进度;
+    if (nearest < 0) return false;
+    progress = g_buf[b][nearest].progress;
     return true;
 }
 
-static inline bool 已破译(float 进度) { return 进度 >= 99.95f; }
+static inline bool is_decoded(float progress) { return progress >= 99.95f; }
 
 // ---------------- 大门 ----------------
 // 大门不进 data[] 数组(getscene() 只认 prop_76/sender，大门那条分支收不到)，
 // 所以绘制侧不走实体循环，直接遍历这里拿到场景对象再自己投影。
-static inline int 大门数() { return g_可用 ? g_门计数[g_活跃] : 0; }
+static inline int door_count() { return g_available ? g_door_count[g_active] : 0; }
 
-static bool 取大门(int i, 大门条目 &out)
+static bool get_door(int i, DoorEntry &out)
 {
-    if (!g_可用) return false;
-    int b = g_活跃;
-    if (i < 0 || i >= g_门计数[b]) return false;
-    out = g_门缓冲[b][i];
+    if (!g_available) return false;
+    int b = g_active;
+    if (i < 0 || i >= g_door_count[b]) return false;
+    out = g_door_buf[b][i];
     return true;
 }
 
 // 大门开启完成。hack_process 是 0~100 的百分比(跟 fix_process 同构，
 // 作者载荷里也是按 "进度:{:.1f}%" 格式化的)
-static inline bool 已开启(const 大门条目 &d) { return d.已开 || d.进度 >= 99.95f; }
+static inline bool door_opened(const DoorEntry &d) { return d.has_open || d.progress >= 99.95f; }
 
-static int 已破译数()
+static int decoded_count()
 {
-    if (!g_可用) return -1;
-    int b = g_活跃, n = g_计数[b], c = 0;
-    for (int i = 0; i < n; i++) if (已破译(g_缓冲[b][i].进度)) c++;
+    if (!g_available) return -1;
+    int b = g_active, n = g_count[b], c = 0;
+    for (int i = 0; i < n; i++) if (is_decoded(g_buf[b][i].progress)) c++;
     return c;
 }
 
@@ -494,25 +549,25 @@ static int 已破译数()
 // 有进度的机器不足 需要 台时返回 false：剩下的名额会落在某台 0% 的机器上，无从判断是哪台。
 // 只在 完成 == 4（即 需要 == 1）时才给结果：此时进度最高的那台就是最后一台，是确定的。
 // 完成 < 4 时的第 需要 名只是按当前进度的预测，中途换人修就会变，所以不显示。
-static bool 最后一台(float &进度)
+static bool last_generator(float &progress)
 {
-    if (!g_可用) return false;
-    int b = g_活跃, n = g_计数[b];
-    int 完成 = 0;
-    float 有进度的[最大机器数];
+    if (!g_available) return false;
+    int b = g_active, n = g_count[b];
+    int done = 0;
+    float in_progress[MAX_GENERATORS];
     int m = 0;
     for (int i = 0; i < n; i++) {
-        float v = g_缓冲[b][i].进度;
-        if (已破译(v)) { 完成++; continue; }
-        if (v > 0.05f) 有进度的[m++] = v;
+        float v = g_buf[b][i].progress;
+        if (is_decoded(v)) { done++; continue; }
+        if (v > 0.05f) in_progress[m++] = v;
     }
-    if (完成 < 4) return false;                    // 不满 4 台时不显示：名次还会变
-    int 需要 = 5 - 完成;
-    if (需要 < 1 || m < 需要) return false;         // 已破译满 5 台则没有"最后一台"可言
+    if (done < 4) return false;                    // 不满 4 台时不显示：名次还会变
+    int need = 5 - done;
+    if (need < 1 || m < need) return false;         // 已破译满 5 台则没有"最后一台"可言
     for (int i = 0; i < m - 1; i++)                 // 只有几个元素，插入排序足够
         for (int j = i + 1; j < m; j++)
-            if (有进度的[j] > 有进度的[i]) { float t = 有进度的[i]; 有进度的[i] = 有进度的[j]; 有进度的[j] = t; }
-    进度 = 有进度的[需要 - 1];                       // 降序第 需要 名
+            if (in_progress[j] > in_progress[i]) { float t = in_progress[i]; in_progress[i] = in_progress[j]; in_progress[j] = t; }
+    progress = in_progress[need - 1];                       // 降序第 需要 名
     return true;
 }
 

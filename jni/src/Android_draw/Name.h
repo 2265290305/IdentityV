@@ -114,6 +114,7 @@ static const NameMapping boss_table[] = {
     {"grocer", "[杂货商]"},
     {"billy", "[台球手]"},
     {"spkunc", "[女王蜂]"},
+    {"beast", "[心兽]"},
 };
 
 // ==================== 道具映射表 ====================
@@ -139,9 +140,9 @@ static const NameMapping prop_table[] = {
 
 // ==================== 通用查找函数 ====================
 template<size_t N>
-static inline const char* table_lookup(const char* 类名, const NameMapping (&table)[N]) {
+static inline const char* table_lookup(const char* class_name, const NameMapping (&table)[N]) {
     for (size_t i = 0; i < N; ++i) {
-        if (strstr(类名, table[i].keyword)) {
+        if (strstr(class_name, table[i].keyword)) {
             return table[i].display;
         }
     }
@@ -149,31 +150,36 @@ static inline const char* table_lookup(const char* 类名, const NameMapping (&t
 }
 
 // ==================== 求生者查找 (带缓存) ====================
-static const char* getplayer(const char* 类名) {
-    if (!类名 || !类名[0]) return "[未知]";
+static const char* getplayer(const char* class_name) {
+    if (!class_name || !class_name[0]) return "[未知]";
     
     // 查缓存
-    auto it = player_cache.find(类名);
+    auto it = player_cache.find(class_name);
     if (it != player_cache.end()) {
         return it->second;
     }
     
     // 未命中，遍历表查找
-    const char* result = table_lookup(类名, player_table);
-    if (!result) result = 类名;  // 未知角色返回原始类名
-    
-    // 存入缓存
-    player_cache[类名] = result;
-    
+    const char* result = table_lookup(class_name, player_table);
+    // 未知角色：返回调用方传进来的原始类名，但**绝不能缓存**。
+    // 调用方给的是全局 std::string filter_class_name 的内部缓冲(draw_Gui.cpp:656 每个对象
+    // resize+读入)，缓存下来等于存了一个别人家的指针：容量一扩(启动头几帧会扩几次)旧缓冲就被释放，
+    // 之后命中这条缓存就是 use-after-free —— strcpy 到 data[].str 时轻则乱码，
+    // 重则读不到 '\0' 越界写坏相邻的 data[] 项。缓存里只允许放静态表里的常量指针。
+    if (!result) return class_name;
+
+    // 存入缓存(值是 player_table 里的静态字符串，生命周期同进程)
+    player_cache[class_name] = result;
+
     return result;
 }
 
 // ==================== 监管者查找 (带缓存) ====================
-static const char* getboss(const char* 类名) {
-    if (!类名 || !类名[0]) return "[未知]";
+static const char* getboss(const char* class_name) {
+    if (!class_name || !class_name[0]) return "[未知]";
     
     // 查缓存
-    auto it = boss_cache.find(类名);
+    auto it = boss_cache.find(class_name);
     if (it != boss_cache.end()) {
         return it->second;
     }
@@ -182,43 +188,44 @@ static const char* getboss(const char* 类名) {
     const char* result = nullptr;
     
     // 无常：区分黑白
-    if (strstr(类名, "wuchang")) {
-        result = strstr(类名, "white") ? "[白无常]" : "[黑无常]";
+    if (strstr(class_name, "wuchang")) {
+        result = strstr(class_name, "white") ? "[白无常]" : "[黑无常]";
     }
     // 伊斯：区分本体和信徒
-    else if (strstr(类名, "yith")) {
-        result = strstr(类名, "ghost") ? "[伊斯人]" : "[时空之影]";
+    else if (strstr(class_name, "yith")) {
+        result = strstr(class_name, "ghost") ? "[伊斯人]" : "[时空之影]";
     }
     // 厂长：特殊路径匹配（排除小丑 butcher_sxwd、鹿头 dm65_butcher_ll，这两个资源都挂在厂长目录下）
-    else if ((strstr(类名, "butcher.gim") || strstr(类名, "boss\\butcher"))
-             && !strstr(类名, "_lod.gim")
-             && !strstr(类名, "butcher_sxwd")  // 排除小丑
-             && !strstr(类名, "dm65_butcher_ll")) {  // 排除鹿头
+    else if ((strstr(class_name, "butcher.gim") || strstr(class_name, "boss\\butcher"))
+             && !strstr(class_name, "_lod.gim")
+             && !strstr(class_name, "butcher_sxwd")  // 排除小丑
+             && !strstr(class_name, "dm65_butcher_ll")) {  // 排除鹿头
         result = "[厂长]";
     }
     // 常规查表
     else {
-        result = table_lookup(类名, boss_table);
+        result = table_lookup(class_name, boss_table);
     }
     
-    if (!result) result = 类名;
-    
-    // 存入缓存
-    boss_cache[类名] = result;
-    
+    // 同 getplayer：未知监管返回原始类名，但不缓存(那是调用方的临时缓冲，会被释放)
+    if (!result) return class_name;
+
+    // 存入缓存(值是静态字符串常量)
+    boss_cache[class_name] = result;
+
     return result;
 }
 
 // ==================== 道具查找 (不缓存，出现少) ====================
-static const char* getprop(const char* 类名) {
-    if (!类名 || !类名[0]) return nullptr;
-    return table_lookup(类名, prop_table);
+static const char* getprop(const char* class_name) {
+    if (!class_name || !class_name[0]) return nullptr;
+    return table_lookup(class_name, prop_table);
 }
 
 // ==================== 场景查找 ====================
-static const char* getscene(const char* 类名) {
-    if (!类名) return nullptr;
-    if (strstr(类名, "prop_76")) return "地窖";
-    if (strstr(类名, "sender")) return "电机";
+static const char* getscene(const char* class_name) {
+    if (!class_name) return nullptr;
+    if (strstr(class_name, "prop_76")) return "地窖";
+    if (strstr(class_name, "sender")) return "电机";
     return nullptr;
 }

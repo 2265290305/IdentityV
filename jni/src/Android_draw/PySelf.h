@@ -55,25 +55,23 @@
 #include <cstring>
 #include <cstdio>
 #include <thread>
+#include <atomic>
 #include <unistd.h>
+#include "PyRoot.h"
 
-// 命名空间叫 本机 而不是 自身：draw_Gui.cpp 里已经有个全局变量 `uintptr_t 自身`，重名编不过
-namespace 本机 {
+// 命名空间跟文件同名(PySelf)；draw_Gui.cpp 里另有全局变量 `uintptr_t self_obj`，别起成 self_obj 之类重名
+namespace PySelf {
 
-// 模块相对偏移，跟 PyProgress.h / PyGenius.h 同源；热更后要一起改
-static const uintptr_t OFF_SYS_MODULES = 0xA7029E8;
-static const uintptr_t OFF_LONG_TYPE   = 0xA026498;
-static const uintptr_t OFF_DICT_TYPE   = 0xA023BF0;
-static const uintptr_t OFF_TRUE        = 0xA0261A0;   // True 单例(实测，跟 PyGenius.h 同源)
+// sys.modules 与 dict/int/True 由 PyRoot.h 运行时找出，这里不再写死模块偏移
 
-static const int 最大废弃数 = 32;
-static const int 最大本体数 = 32;
+static const int MAX_STALE = 32;
+static const int MAX_BODIES = 32;
 
 // 要扫的单位类型：1=监管(巡视者也在这里) 2=求生者(机械玩偶、幻灯师分身也在这里) 236=梦之信徒
 // 1065=伊斯人幻影(yith_ghost03，2026-09-22 实测；漏了它时幻影被本体集合挡掉)。
 // 局中召出来的从属单位常有独立的键，某个召唤物被误挡时先用 _scripts\cmd_phase.py 查它在哪个键下
-static const int 单位类型表[] = {1, 2, 236, 1065};
-static const int 单位类型数 = sizeof(单位类型表) / sizeof(单位类型表[0]);
+static const int UNIT_TYPES[] = {1, 2, 236, 1065};
+static const int UNIT_TYPE_COUNT = sizeof(UNIT_TYPES) / sizeof(UNIT_TYPES[0]);
 
 // ---- 本体集合：哪些场景对象是"角色本体"(2026-09-22 实测) ----
 // 场景数组里跟角色同名、或者挂在角色身上的对象很多：_fragrance_image(每个求生者一份、同名、恒不可见)、
@@ -85,24 +83,24 @@ static const int 单位类型数 = sizeof(单位类型表) / sizeof(单位类型
 //     (它 is_clone=False、is_puppet=False，这两个名字都骗人，别用)
 //   - 机械玩偶 MyCivilianPuppetUnit 在 [2] 里、is_civilian_puppet=False，**保留**(用户要画它)
 //   - owner_uid 别用：机械玩偶实测为 None，可能只在被操控时才有值
-struct 快照 {
-    uint64_t 锚点;                  // 当前操控单位的场景对象，0 = 没读到
-    int      阵营;                  // 1=监管 2=求生者 其它=从属单位的 unit_type
+struct Snapshot {
+    uint64_t anchor;                  // 当前操控单位的场景对象，0 = 没读到
+    int      camp;                  // 1=监管 2=求生者 其它=从属单位的 unit_type
     int64_t  uid;
-    uint64_t 废弃[最大废弃数];
-    int      废弃数;
-    uint64_t 本体[最大本体数];      // 本体集合，见上
-    int      本体数;
-    uint64_t 监管本体;              // [1] 里第一个类名不含 Puppet 的单位(跳过巡视者)，0 = 没有
+    uint64_t stale[MAX_STALE];
+    int      stale_count;
+    uint64_t body[MAX_BODIES];      // 本体集合，见上
+    int      body_count;
+    uint64_t hunter_body;              // [1] 里第一个类名不含 Puppet 的单位(跳过巡视者)，0 = 没有
 };
 
 // 双缓冲发布：写线程填非活跃缓冲，填完再翻转，绘制线程永远读到完整的一份
-static 快照 g_缓冲[2];
-static volatile int g_活跃 = 0;
+static Snapshot g_buf[2];
+static std::atomic<int> g_active{0};      // 见 PyProgress.h 同名变量的注释(volatile 不保证发布顺序)
 
 static uintptr_t g_libbase = 0;
-static uint64_t  g_整数类型 = 0, g_字典类型 = 0, g_真 = 0;
-static uint64_t  g_模块字典 = 0;
+static uint64_t  g_int_type = 0, g_dict_type = 0, g_true = 0;
+static uint64_t  g_module_dict = 0;
 static int64_t   g_i_cam = -1, g_i_cam_unit = -1;
 static int64_t   g_i_unit_mgr = -1, g_i_ubt = -1;
 static int64_t   g_i_model = -1, g_i_another = -1, g_i_utype = -1, g_i_uid = -1;
@@ -110,29 +108,29 @@ static int64_t   g_i_model = -1, g_i_another = -1, g_i_utype = -1, g_i_uid = -1;
 // 各玩家类(ButcherUnit / CivilianUnit / MyCivilianUnit / 各种 Puppet ...)实例字典大小不同，
 // another_model 的序号也不同；共用一个缓存时，遍历每换一个类就失效一次、从头按名字扫到它
 // (字典上千条，每条 2 次读取)，一轮要扫 2~4 次，占了这个线程九成的读取量。
-// 分开存之后每个类只在第一次出现时扫一次。缓存从不被直接信任：校准序号() 每次都按名字核对，
+// 分开存之后每个类只在第一次出现时扫一次。缓存从不被直接信任：resolve_index() 每次都按名字核对，
 // 核对不上就重扫，所以最坏情况就是退回共用缓存那种多扫几遍，不会读错属性。
 // 表满了(类比这个多)就退回共用的 g_i_*。model / is_civilian_puppet 同理，一起按类存。
-struct 类序号 { uint64_t 类型; int64_t 另形; int64_t 模型; int64_t 从属; bool 是Puppet; };
-static const int 最大类数 = 8;
-static 类序号 g_另形缓存[最大类数];
-static int     g_另形缓存数 = 0;
+struct ClassIndexCache { uint64_t type; int64_t i_another; int64_t i_model; int64_t i_cpuppet; bool is_puppet; };
+static const int MAX_CLASSES = 8;
+static ClassIndexCache g_class_cache[MAX_CLASSES];
+static int     g_class_cache_count = 0;
 static int64_t g_i_unit_model = -1, g_i_cpuppet = -1;   // 表满时的共用缓存
 
-static volatile bool g_可用 = false;
+static volatile bool g_available = false;
 // 局外(大厅/准备阶段)：units_by_type 完整读出来了、而且没有键 1/2。
 // 准备阶段 cam.unit 是 MyCityUnit，它的 model+0x20 读不出场景指针(2026-09-22 实测)，锚点那步会失败，
-// 所以这个标志不挂在 快照/g_可用 上，在锚点之前单独算、单独发布。读不全一律算"不是局外"
-static volatile bool g_局外 = false;
-static volatile int  g_连续失败 = 0;
-static char g_状态[96] = "未启动";
+// 所以这个标志不挂在 快照/g_available 上，在锚点之前单独算、单独发布。读不全一律算"不是局外"
+static volatile bool g_in_lobby = false;
+static volatile int  g_fail_streak = 0;
+static char g_status[96] = "未启动";
 
-static inline bool 是对象(uint64_t p) { return p > 0x7000000000ULL && p < 0x8000000000ULL; }
+static inline bool is_obj(uint64_t p) { return p > 0x7000000000ULL && p < 0x8000000000ULL; }
 
 // PyASCIIObject: 长度在 +0x10，紧凑 ASCII 数据在 +0x30
-static bool 字符串等于(uint64_t s, const char *want)
+static bool str_equals(uint64_t s, const char *want)
 {
-    if (!是对象(s)) return false;
+    if (!is_obj(s)) return false;
     int64_t len = 0;
     if (!vm_readv(s + 0x10, &len, 8)) return false;
     size_t n = strlen(want);
@@ -142,70 +140,127 @@ static bool 字符串等于(uint64_t s, const char *want)
     return memcmp(buf, want, n) == 0;
 }
 
-struct 字典 { uint64_t 条目起; int 步长; int64_t 条数; };
+struct Dict { uint64_t entries; int stride; int64_t n_entries; };
 
-static bool 取字典(uint64_t d, 字典 &out)
+static bool read_dict(uint64_t d, Dict &out)
 {
-    if (!是对象(d)) return false;
+    if (!is_obj(d)) return false;
     uint64_t keys = getPtr64(d + 0x20);
-    if (!是对象(keys)) return false;
+    if (!is_obj(keys)) return false;
     uint8_t hdr[32];
     if (!vm_readv(keys, hdr, 32)) return false;
     uint8_t idxb = hdr[9];
     uint8_t kind = hdr[10];
     int64_t nent = 0; memcpy(&nent, hdr + 24, 8);
     if (idxb > 30 || nent < 0 || nent > (1 << 22)) return false;
-    out.条目起 = keys + 32 + ((uint64_t)1 << idxb);
-    out.步长   = (kind == 0) ? 24 : 16;
-    out.条数   = nent;
+    out.entries = keys + 32 + ((uint64_t)1 << idxb);
+    out.stride   = (kind == 0) ? 24 : 16;
+    out.n_entries   = nent;
     return true;
 }
 
-static inline uint64_t 键槽(const 字典 &k, int64_t i) { return k.条目起 + i * k.步长 + (k.步长 == 24 ? 8 : 0); }
-static inline uint64_t 值槽(const 字典 &k, int64_t i) { return k.条目起 + i * k.步长 + (k.步长 == 24 ? 16 : 8); }
+static inline uint64_t key_slot(const Dict &k, int64_t i) { return k.entries + i * k.stride + (k.stride == 24 ? 8 : 0); }
+static inline uint64_t value_slot(const Dict &k, int64_t i) { return k.entries + i * k.stride + (k.stride == 24 ? 16 : 8); }
 
-static int64_t 查名(uint64_t d, const char *name, int64_t hint)
+// ---- 字典查找的两项优化(2026-09-23) ----
+// 原来每比一个键要 3 次驱动读(取键指针 + 读长度 + 读内容)，全扫上千条的实例字典就是几千次读。
+//   a) 整块读条目：entries 是连续内存，一次 vm_readv 读完(1300 条 * 24 字节 = 31KB)，
+//      之后在本地取键指针，省掉"每条一次取指针"。
+//   b) 驻留键指针：CPython 会驻留标识符形式的属性名，所以同一个属性名在进程里就是同一个
+//      字符串对象。第一次按名字找到后记下键对象地址，以后只比指针，连字符串都不用读。
+//      这个假设不成立时会自动退回按名字比较，只是慢一点，不会读错。
+// 效果：命中缓存的校验从 3 次读降到 1 次；全扫从几千次降到 1 次(整块) + 本地比较。
+static uint8_t g_entry_block[48 * 1024];
+struct InternedName { const char *name; uint64_t key_obj; };
+static InternedName g_interned[32];
+static int g_interned_n = 0;
+
+static uint64_t interned_of(const char *name)
 {
-    字典 k;
-    if (!取字典(d, k)) return -1;
-    if (hint >= 0 && hint < k.条数 && 字符串等于(getPtr64(键槽(k, hint)), name)) return hint;
-    for (int64_t i = 0; i < k.条数; i++)
-        if (字符串等于(getPtr64(键槽(k, i)), name)) return i;
+    for (int i = 0; i < g_interned_n; i++)
+        if (strcmp(g_interned[i].name, name) == 0) return g_interned[i].key_obj;
+    return 0;
+}
+
+static void remember_interned(const char *name, uint64_t kp)
+{
+    for (int i = 0; i < g_interned_n; i++)
+        if (strcmp(g_interned[i].name, name) == 0) { g_interned[i].key_obj = kp; return; }
+    if (g_interned_n < (int)(sizeof(g_interned) / sizeof(g_interned[0]))) {
+        g_interned[g_interned_n].name = name;          // 调用方传的都是字符串常量，生命周期同进程
+        g_interned[g_interned_n].key_obj = kp;
+        g_interned_n++;
+    }
+}
+
+static int64_t find_key(uint64_t d, const char *name, int64_t hint)
+{
+    Dict k;
+    if (!read_dict(d, k)) return -1;
+    const uint64_t want = interned_of(name);
+    if (hint >= 0 && hint < k.n_entries) {
+        uint64_t kp = getPtr64(key_slot(k, hint));
+        if (want && kp == want) return hint;                        // 命中缓存：只花 1 次读
+        if (str_equals(kp, name)) { remember_interned(name, kp); return hint; }
+    }
+    size_t bytes = (size_t)k.n_entries * k.stride;
+    int key_off = (k.stride == 24) ? 8 : 0;
+    if (bytes > 0 && bytes <= sizeof(g_entry_block) && vm_readv(k.entries, g_entry_block, bytes)) {
+        for (int pass = 0; pass < 2; pass++) {
+            if (pass == 0 && !want) continue;                       // 还不知道键地址，直接进第二遍
+            for (int64_t i = 0; i < k.n_entries; i++) {
+                uint64_t kp = 0;
+                memcpy(&kp, g_entry_block + (size_t)i * k.stride + key_off, 8);
+                kp &= 0x00FFFFFFFFFFFFFFULL;
+                if (pass == 0) { if (kp == want) return i; }
+                else if (str_equals(kp, name)) { remember_interned(name, kp); return i; }
+            }
+        }
+        return -1;
+    }
+    // 整块读失败(条目跨到换出的页等)：退回逐条读，行为和以前完全一样
+    for (int64_t i = 0; i < k.n_entries; i++)
+        if (str_equals(getPtr64(key_slot(k, i)), name)) return i;
     return -1;
 }
 
-static uint64_t 取属性(uint64_t d, int64_t idx)
+static uint64_t get_attr(uint64_t d, int64_t idx)
 {
-    字典 k;
-    if (!取字典(d, k) || idx < 0 || idx >= k.条数) return 0;
-    return getPtr64(值槽(k, idx));
+    Dict k;
+    if (!read_dict(d, k) || idx < 0 || idx >= k.n_entries) return 0;
+    return getPtr64(value_slot(k, idx));
 }
 
-static int64_t 校准序号(uint64_t d, const 字典 &dk, int64_t 缓存, const char *name)
+static int64_t resolve_index(uint64_t d, const Dict &dk, int64_t cached, const char *name)
 {
-    if (缓存 >= 0 && 缓存 < dk.条数 && 字符串等于(getPtr64(键槽(dk, 缓存)), name)) return 缓存;
-    return 查名(d, name, -1);
+    if (cached >= 0 && cached < dk.n_entries) {
+        uint64_t kp = getPtr64(key_slot(dk, cached));
+        uint64_t want = interned_of(name);
+        if (want && kp == want) return cached;                      // 驻留键指针：校验只要 1 次读
+        if (str_equals(kp, name)) { remember_interned(name, kp); return cached; }
+    }
+    return find_key(d, name, -1);
 }
 
 // managed-dict 实例：dict 指针在对象前 0x18。多校验一次 ob_type 是 dict，
 // 免得把别的布局的对象当实例用(g_cam_ctrl 不一定跟 unit 同布局)
-static uint64_t 取实例字典(uint64_t obj)
+static uint64_t get_inst_dict(uint64_t obj)
 {
-    if (!是对象(obj)) return 0;
+    if (!is_obj(obj)) return 0;
     uint64_t d = getPtr64(obj - 0x18);
-    if (!是对象(d)) return 0;
-    if (getPtr64(d + 8) != g_字典类型) return 0;
+    if (!is_obj(d)) return 0;
+    if (getPtr64(d + 8) != g_dict_type) return 0;
     return d;
 }
 
-static bool 读整数(uint64_t vp, int64_t &out)
+static bool read_int(uint64_t vp, int64_t &out)
 {
-    if (!是对象(vp)) return false;
+    if (!is_obj(vp)) return false;
     uint8_t b[32];
     if (!vm_readv(vp, b, 32)) return false;
     int64_t rc = 0; memcpy(&rc, b, 8);
     uint64_t tp = 0; memcpy(&tp, b + 8, 8); tp &= 0x00FFFFFFFFFFFFFFULL;
-    if (rc <= 0 || tp != g_整数类型) return false;
+    if (rc <= 0 || tp != g_int_type) return false;
     int64_t sz = 0; memcpy(&sz, b + 16, 8);
     uint32_t dg = 0; memcpy(&dg, b + 24, 4);
     out = (sz == 0) ? 0 : (int64_t)dg;
@@ -214,258 +269,262 @@ static bool 读整数(uint64_t vp, int64_t &out)
 }
 
 // Python 对象 -> 它持有的场景对象指针(world.model + 0x20)
-static uint64_t 取场景对象(uint64_t 模型对象)
+static uint64_t get_scene_obj(uint64_t model_obj)
 {
-    if (!是对象(模型对象)) return 0;
-    uint64_t sp = getPtr64(模型对象 + 0x20);
-    return 是对象(sp) ? sp : 0;
+    if (!is_obj(model_obj)) return 0;
+    uint64_t sp = getPtr64(model_obj + 0x20);
+    return is_obj(sp) ? sp : 0;
 }
 
-static bool 解析模块()
+static bool resolve_module()
 {
-    uint64_t sm = getPtr64(g_libbase + OFF_SYS_MODULES);
-    if (!是对象(sm)) { snprintf(g_状态, sizeof(g_状态), "sys.modules 取不到"); return false; }
-    if (getPtr64(sm + 8) != g_字典类型) { snprintf(g_状态, sizeof(g_状态), "sys.modules 不是dict(偏移已失效)"); return false; }
-    int64_t i = 查名(sm, "game_kernel", -1);
-    if (i < 0) { snprintf(g_状态, sizeof(g_状态), "找不到 game_kernel 模块"); return false; }
-    uint64_t mod = 取属性(sm, i);
-    if (!是对象(mod)) { snprintf(g_状态, sizeof(g_状态), "game_kernel 模块对象无效"); return false; }
-    g_模块字典 = getPtr64(mod + 0x10);            // module.md_dict
-    if (!是对象(g_模块字典)) { g_模块字典 = 0; snprintf(g_状态, sizeof(g_状态), "md_dict 无效"); return false; }
+    uint64_t sm = getPtr64(PyRoot::g_modules_slot);
+    if (!is_obj(sm)) { snprintf(g_status, sizeof(g_status), "sys.modules 取不到"); return false; }
+    if (getPtr64(sm + 8) != g_dict_type) { snprintf(g_status, sizeof(g_status), "sys.modules 不是dict(偏移已失效)"); return false; }
+    int64_t i = find_key(sm, "game_kernel", -1);
+    if (i < 0) { snprintf(g_status, sizeof(g_status), "找不到 game_kernel 模块"); return false; }
+    uint64_t mod = get_attr(sm, i);
+    if (!is_obj(mod)) { snprintf(g_status, sizeof(g_status), "game_kernel 模块对象无效"); return false; }
+    g_module_dict = getPtr64(mod + 0x10);            // module.md_dict
+    if (!is_obj(g_module_dict)) { g_module_dict = 0; snprintf(g_status, sizeof(g_status), "md_dict 无效"); return false; }
     return true;
 }
 
 // units_by_type 里找某个 int 键对应的 list
-static uint64_t 取分类表(uint64_t ubt, int 类型)
+static uint64_t get_type_list(uint64_t ubt, int type)
 {
-    字典 k;
-    if (!取字典(ubt, k)) return 0;
-    for (int64_t i = 0; i < k.条数; i++) {
-        uint64_t kp = getPtr64(键槽(k, i));
-        if (!是对象(kp) || getPtr64(kp + 8) != g_整数类型) continue;
+    Dict k;
+    if (!read_dict(ubt, k)) return 0;
+    for (int64_t i = 0; i < k.n_entries; i++) {
+        uint64_t kp = getPtr64(key_slot(k, i));
+        if (!is_obj(kp) || getPtr64(kp + 8) != g_int_type) continue;
         int64_t sz = 0; uint32_t dg = 0;
         vm_readv(kp + 16, &sz, 8);
         vm_readv(kp + 24, &dg, 4);
-        if (sz == 1 && (int)dg == 类型) return getPtr64(值槽(k, i));
+        if (sz == 1 && (int)dg == type) return getPtr64(value_slot(k, i));
     }
     return 0;
 }
 
-// 判断是不是局外。units_by_type 的每个键都要读成功才下结论 —— 取分类表() 返回 0 分不清
+// 判断是不是局外。units_by_type 的每个键都要读成功才下结论 —— get_type_list() 返回 0 分不清
 // "没有这个键"和"键对象所在页读不到"，拿它判会在对局中途的读失败里误判成局外、把人全藏掉。
 // 局外 = 没有键 1(监管) 也没有键 2(求生者)。2026-09-22 准备阶段实测键只有 53/59/74/100/1009。
-static bool 判局外(uint64_t ubt, bool &局外)
+static bool check_lobby(uint64_t ubt, bool &in_lobby)
 {
-    字典 k;
-    if (!取字典(ubt, k) || k.条数 <= 0) return false;
-    bool 有玩家 = false;
-    for (int64_t i = 0; i < k.条数; i++) {
-        uint64_t kp = getPtr64(键槽(k, i));
+    Dict k;
+    if (!read_dict(ubt, k) || k.n_entries <= 0) return false;
+    bool has_player = false;
+    for (int64_t i = 0; i < k.n_entries; i++) {
+        uint64_t kp = getPtr64(key_slot(k, i));
         if (kp == 0) continue;                         // 已删除的条目
-        if (!是对象(kp) || getPtr64(kp + 8) != g_整数类型) return false;
+        if (!is_obj(kp) || getPtr64(kp + 8) != g_int_type) return false;
         int64_t sz = 0; uint32_t dg = 0;
         if (!vm_readv(kp + 16, &sz, 8) || !vm_readv(kp + 24, &dg, 4)) return false;
-        if (sz == 1 && (dg == 1 || dg == 2)) 有玩家 = true;
+        if (sz == 1 && (dg == 1 || dg == 2)) has_player = true;
     }
-    局外 = !有玩家;
+    in_lobby = !has_player;
     return true;
 }
 
-static bool 取列表(uint64_t L, int64_t &n, uint64_t &items)
+static bool read_list(uint64_t L, int64_t &n, uint64_t &items)
 {
-    if (!是对象(L)) return false;
+    if (!is_obj(L)) return false;
     if (!vm_readv(L + 0x10, &n, 8)) return false;
     if (n < 0 || n > 256) return false;
     if (n == 0) { items = 0; return true; }
     items = getPtr64(L + 0x18);
-    return 是对象(items);
+    return is_obj(items);
 }
 
 // 类名(PyTypeObject.tp_name，+0x18 是 char*)里含不含 Puppet。
 // 实测 [1] 里的巡视者是 MyButcherPatrolPuppetUnit，挑"监管本体"时要跳过它
-static bool 类名含Puppet(uint64_t 类型)
+static bool class_name_has_puppet(uint64_t type)
 {
-    uint64_t np = getPtr64(类型 + 0x18);
-    if (!是对象(np)) return false;
+    uint64_t np = getPtr64(type + 0x18);
+    if (!is_obj(np)) return false;
     char buf[48] = {0};                                // 最长的 MyButcherPatrolPuppetUnit 也才 25 字节
     if (!vm_readv(np, buf, sizeof(buf) - 1)) return false;
     return strstr(buf, "Puppet") != nullptr;
 }
 
-static inline void 收入(uint64_t *表, int &数, int 上限, uint64_t sp)
+static inline void add_unique(uint64_t *tbl, int &cnt, int cap, uint64_t sp)
 {
-    for (int j = 0; j < 数; j++) if (表[j] == sp) return;
-    if (数 < 上限) 表[数++] = sp;
+    for (int j = 0; j < cnt; j++) if (tbl[j] == sp) return;
+    if (cnt < cap) tbl[cnt++] = sp;
 }
 
 // 扫一类单位：
 //   another_model -> 废弃模型黑名单
 //   model         -> 本体集合(幻灯师分身 is_civilian_puppet==True 不收)
 //   [1] 里第一个类名不含 Puppet 的 -> 监管本体(预知监管用)
-static void 收单位(uint64_t ubt, int 类型, 快照 &出)
+static void collect_units(uint64_t ubt, int type, Snapshot &res)
 {
-    uint64_t 列表 = 取分类表(ubt, 类型);
+    uint64_t lst = get_type_list(ubt, type);
     int64_t n = 0; uint64_t items = 0;
-    if (!取列表(列表, n, items) || n == 0) return;
+    if (!read_list(lst, n, items) || n == 0) return;
 
     for (int64_t i = 0; i < n; i++) {
         uint64_t inst = getPtr64(items + i * 8);
-        uint64_t d = 取实例字典(inst);
+        uint64_t d = get_inst_dict(inst);
         if (!d) continue;
-        字典 dk;
-        if (!取字典(d, dk)) continue;
+        Dict dk;
+        if (!read_dict(d, dk)) continue;
 
-        // 按实例的类取序号缓存(见 g_另形缓存)。类型指针读不到、或表满了就用共用缓存
-        uint64_t 类型 = getPtr64(inst + 8);
-        类序号 *槽 = nullptr;
-        if (是对象(类型)) {
-            for (int j = 0; j < g_另形缓存数; j++)
-                if (g_另形缓存[j].类型 == 类型) { 槽 = &g_另形缓存[j]; break; }
-            if (!槽 && g_另形缓存数 < 最大类数) {
-                槽 = &g_另形缓存[g_另形缓存数++];
-                槽->类型 = 类型;
-                槽->另形 = 槽->模型 = 槽->从属 = -1;
-                槽->是Puppet = 类名含Puppet(类型);    // 类名一个类只读一次
+        // 按实例的类取序号缓存(见 g_class_cache)。类型指针读不到、或表满了就用共用缓存
+        // 别叫 type：会遮住参数 type(单位类型键)，导致下面 type == 1 永远不成立、hunter_body 永远拿不到
+        uint64_t cls = getPtr64(inst + 8);
+        ClassIndexCache *slot = nullptr;
+        if (is_obj(cls)) {
+            for (int j = 0; j < g_class_cache_count; j++)
+                if (g_class_cache[j].type == cls) { slot = &g_class_cache[j]; break; }
+            if (!slot && g_class_cache_count < MAX_CLASSES) {
+                slot = &g_class_cache[g_class_cache_count++];
+                slot->type = cls;
+                slot->i_another = slot->i_model = slot->i_cpuppet = -1;
+                slot->is_puppet = class_name_has_puppet(cls);    // 类名一个类只读一次
             }
         }
-        int64_t &另形 = 槽 ? 槽->另形 : g_i_another;
-        int64_t &模型 = 槽 ? 槽->模型 : g_i_unit_model;
-        int64_t &从属 = 槽 ? 槽->从属 : g_i_cpuppet;
+        int64_t &i_another = slot ? slot->i_another : g_i_another;
+        int64_t &i_model = slot ? slot->i_model : g_i_unit_model;
+        int64_t &i_cpuppet = slot ? slot->i_cpuppet : g_i_cpuppet;
 
         // 实测所有玩家类都有 another_model(没有第二形态时值是 None)，查不到就跳过(不是错误)
-        另形 = 校准序号(d, dk, 另形, "another_model");
-        if (另形 >= 0) {
-            uint64_t sp = 取场景对象(getPtr64(值槽(dk, 另形)));
-            if (sp) 收入(出.废弃, 出.废弃数, 最大废弃数, sp);
+        i_another = resolve_index(d, dk, i_another, "another_model");
+        if (i_another >= 0) {
+            uint64_t sp = get_scene_obj(getPtr64(value_slot(dk, i_another)));
+            if (sp) add_unique(res.stale, res.stale_count, MAX_STALE, sp);
         }
 
-        模型 = 校准序号(d, dk, 模型, "model");
-        if (模型 < 0) continue;
-        uint64_t 本体 = 取场景对象(getPtr64(值槽(dk, 模型)));
-        if (!本体) continue;
+        i_model = resolve_index(d, dk, i_model, "model");
+        if (i_model < 0) continue;
+        uint64_t body = get_scene_obj(getPtr64(value_slot(dk, i_model)));
+        if (!body) continue;
 
         // 幻灯师分身：is_civilian_puppet 是 True 单例。属性不存在(监管类)或读不到都按"不是分身"
-        从属 = 校准序号(d, dk, 从属, "is_civilian_puppet");
-        if (从属 >= 0 && getPtr64(值槽(dk, 从属)) == g_真) continue;
+        i_cpuppet = resolve_index(d, dk, i_cpuppet, "is_civilian_puppet");
+        if (i_cpuppet >= 0 && getPtr64(value_slot(dk, i_cpuppet)) == g_true) continue;
 
-        收入(出.本体, 出.本体数, 最大本体数, 本体);
-        if (类型 == 1 && 出.监管本体 == 0 && !(槽 ? 槽->是Puppet : 类名含Puppet(getPtr64(inst + 8))))
-            出.监管本体 = 本体;
+        add_unique(res.body, res.body_count, MAX_BODIES, body);
+        if (type == 1 && res.hunter_body == 0 && !(slot ? slot->is_puppet : class_name_has_puppet(cls)))
+            res.hunter_body = body;
     }
 }
 
-static bool 尝试刷新()
+static bool try_refresh()
 {
-    if (g_模块字典 == 0 && !解析模块()) { g_局外 = false; return false; }
+    if (g_module_dict == 0 && !resolve_module()) { g_in_lobby = false; return false; }
 
-    快照 出;
-    memset(&出, 0, sizeof(出));
+    Snapshot res;
+    memset(&res, 0, sizeof(res));
 
-    // ---- 零、units_by_type + 局外判定(必须在锚点之前，见 g_局外) ----
-    g_i_unit_mgr = 查名(g_模块字典, "unit_mgr", g_i_unit_mgr);
-    uint64_t um = (g_i_unit_mgr >= 0) ? 取属性(g_模块字典, g_i_unit_mgr) : 0;
-    uint64_t ud = 取实例字典(um);
+    // ---- 零、units_by_type + 局外判定(必须在锚点之前，见 g_in_lobby) ----
+    g_i_unit_mgr = find_key(g_module_dict, "unit_mgr", g_i_unit_mgr);
+    uint64_t um = (g_i_unit_mgr >= 0) ? get_attr(g_module_dict, g_i_unit_mgr) : 0;
+    uint64_t ud = get_inst_dict(um);
     uint64_t ubt = 0;
     if (ud) {
-        g_i_ubt = 查名(ud, "units_by_type", g_i_ubt);
-        ubt = (g_i_ubt >= 0) ? 取属性(ud, g_i_ubt) : 0;
+        g_i_ubt = find_key(ud, "units_by_type", g_i_ubt);
+        ubt = (g_i_ubt >= 0) ? get_attr(ud, g_i_ubt) : 0;
     }
-    bool 局外 = false;
-    g_局外 = 是对象(ubt) && 判局外(ubt, 局外) && 局外;
+    bool in_lobby = false;
+    g_in_lobby = is_obj(ubt) && check_lobby(ubt, in_lobby) && in_lobby;
 
     // ---- 一、当前操控单位：g_cam_ctrl.unit ----
-    g_i_cam = 查名(g_模块字典, "g_cam_ctrl", g_i_cam);
-    uint64_t cam = (g_i_cam >= 0) ? 取属性(g_模块字典, g_i_cam) : 0;
-    if (!是对象(cam)) { snprintf(g_状态, sizeof(g_状态), "g_cam_ctrl 无效(未在对局中?)"); return false; }
+    g_i_cam = find_key(g_module_dict, "g_cam_ctrl", g_i_cam);
+    uint64_t cam = (g_i_cam >= 0) ? get_attr(g_module_dict, g_i_cam) : 0;
+    if (!is_obj(cam)) { snprintf(g_status, sizeof(g_status), "g_cam_ctrl 无效(未在对局中?)"); return false; }
 
-    uint64_t camd = 取实例字典(cam);
-    if (!camd) { snprintf(g_状态, sizeof(g_状态), "g_cam_ctrl 不是 managed-dict 布局"); return false; }
-    字典 camk;
-    if (!取字典(camd, camk)) { snprintf(g_状态, sizeof(g_状态), "g_cam_ctrl 字典异常"); return false; }
+    uint64_t camd = get_inst_dict(cam);
+    if (!camd) { snprintf(g_status, sizeof(g_status), "g_cam_ctrl 不是 managed-dict 布局"); return false; }
+    Dict camk;
+    if (!read_dict(camd, camk)) { snprintf(g_status, sizeof(g_status), "g_cam_ctrl 字典异常"); return false; }
 
-    g_i_cam_unit = 校准序号(camd, camk, g_i_cam_unit, "unit");
-    if (g_i_cam_unit < 0) { snprintf(g_状态, sizeof(g_状态), "g_cam_ctrl 里没有 unit"); return false; }
-    uint64_t 我 = getPtr64(值槽(camk, g_i_cam_unit));
-    if (!是对象(我)) { snprintf(g_状态, sizeof(g_状态), "cam.unit 为空"); return false; }
+    g_i_cam_unit = resolve_index(camd, camk, g_i_cam_unit, "unit");
+    if (g_i_cam_unit < 0) { snprintf(g_status, sizeof(g_status), "g_cam_ctrl 里没有 unit"); return false; }
+    uint64_t me = getPtr64(value_slot(camk, g_i_cam_unit));
+    if (!is_obj(me)) { snprintf(g_status, sizeof(g_status), "cam.unit 为空"); return false; }
 
-    uint64_t 我d = 取实例字典(我);
-    if (!我d) { snprintf(g_状态, sizeof(g_状态), "cam.unit 没有实例字典"); return false; }
-    字典 我k;
-    if (!取字典(我d, 我k)) { snprintf(g_状态, sizeof(g_状态), "cam.unit 字典异常"); return false; }
+    uint64_t me_d = get_inst_dict(me);
+    if (!me_d) { snprintf(g_status, sizeof(g_status), "cam.unit 没有实例字典"); return false; }
+    Dict me_k;
+    if (!read_dict(me_d, me_k)) { snprintf(g_status, sizeof(g_status), "cam.unit 字典异常"); return false; }
 
-    g_i_model = 校准序号(我d, 我k, g_i_model, "model");
-    g_i_utype = 校准序号(我d, 我k, g_i_utype, "unit_type");
-    g_i_uid   = 校准序号(我d, 我k, g_i_uid,   "uid");
+    g_i_model = resolve_index(me_d, me_k, g_i_model, "model");
+    g_i_utype = resolve_index(me_d, me_k, g_i_utype, "unit_type");
+    g_i_uid   = resolve_index(me_d, me_k, g_i_uid,   "uid");
 
-    if (g_i_model >= 0) 出.锚点 = 取场景对象(getPtr64(值槽(我k, g_i_model)));
-    if (g_i_utype >= 0) { int64_t v = 0; if (读整数(getPtr64(值槽(我k, g_i_utype)), v)) 出.阵营 = (int)v; }
-    if (g_i_uid   >= 0) { int64_t v = 0; if (读整数(getPtr64(值槽(我k, g_i_uid)),   v)) 出.uid  = v; }
+    if (g_i_model >= 0) res.anchor = get_scene_obj(getPtr64(value_slot(me_k, g_i_model)));
+    if (g_i_utype >= 0) { int64_t v = 0; if (read_int(getPtr64(value_slot(me_k, g_i_utype)), v)) res.camp = (int)v; }
+    if (g_i_uid   >= 0) { int64_t v = 0; if (read_int(getPtr64(value_slot(me_k, g_i_uid)),   v)) res.uid  = v; }
 
-    if (出.锚点 == 0) { snprintf(g_状态, sizeof(g_状态), "cam.unit.model 读不到"); return false; }
+    if (res.anchor == 0) { snprintf(g_status, sizeof(g_status), "cam.unit.model 读不到"); return false; }
 
     // ---- 二、废弃模型黑名单 + 本体集合 + 监管本体 ----
-    if (是对象(ubt))
-        for (int i = 0; i < 单位类型数; i++) 收单位(ubt, 单位类型表[i], 出);
+    if (is_obj(ubt))
+        for (int i = 0; i < UNIT_TYPE_COUNT; i++) collect_units(ubt, UNIT_TYPES[i], res);
     // 这一段读不到不算失败：锚点已经拿到了。本体数为 0 时绘制侧会退回按类名画
 
-    int 写 = 1 - g_活跃;
-    g_缓冲[写] = 出;
-    g_活跃 = 写;                                   // 填完再翻转
-    snprintf(g_状态, sizeof(g_状态), "正常 %s uid=%lld 本体%d 废弃%d",
-             出.阵营 == 1 ? "监管" : (出.阵营 == 2 ? "求生" : "从属"),
-             (long long)出.uid, 出.本体数, 出.废弃数);
+    int write_idx = 1 - g_active;
+    g_buf[write_idx] = res;
+    g_active = write_idx;                                   // 填完再翻转
+    snprintf(g_status, sizeof(g_status), "正常 %s uid=%lld 本体%d 废弃%d",
+             res.camp == 1 ? "监管" : (res.camp == 2 ? "求生" : "从属"),
+             (long long)res.uid, res.body_count, res.stale_count);
     return true;
 }
 
-static void 刷新一次()
+static void refresh_once()
 {
     if (g_libbase == 0) return;
-    if (尝试刷新()) { g_可用 = true; g_连续失败 = 0; return; }
-    g_可用 = false;
-    if (++g_连续失败 >= 8) {                       // 连续失败就把序号缓存作废，下一轮按名字重找
-        g_模块字典 = 0;
+    if (!PyRoot::ensure()) {
+        g_available = false;
+        snprintf(g_status, sizeof(g_status), "%s", PyRoot::status_text());
+        return;
+    }
+    g_int_type = PyRoot::g_int_type; g_dict_type = PyRoot::g_dict_type; g_true = PyRoot::g_true;
+    if (try_refresh()) { g_available = true; g_fail_streak = 0; return; }
+    g_available = false;
+    if (++g_fail_streak >= 8) {                       // 连续失败就把序号缓存作废，下一轮按名字重找
+        g_module_dict = 0;
         g_i_cam = g_i_cam_unit = g_i_unit_mgr = g_i_ubt = -1;
         g_i_model = g_i_another = g_i_utype = g_i_uid = -1;
         g_i_unit_model = g_i_cpuppet = -1;
-        g_另形缓存数 = 0;
-        g_连续失败 = 0;
+        g_class_cache_count = 0;
+        g_fail_streak = 0;
     }
 }
 
 // 自身锚点每帧都要用，而且切换操控对象时要立刻跟上，所以比天赋刷得勤(约一帧 60fps)
-static const int 刷新间隔毫秒 = 16;
+static const int REFRESH_INTERVAL_MS = 16;
 
-static void 线程体()
+static void thread_main()
 {
     while (true) {
-        刷新一次();
-        usleep(刷新间隔毫秒 * 1000);
+        refresh_once();
+        usleep(REFRESH_INTERVAL_MS * 1000);
     }
 }
 
-static void 启动(uintptr_t libbase)
+static void start(uintptr_t libbase)
 {
     if (g_libbase != 0) return;
     g_libbase   = libbase;
-    g_整数类型 = libbase + OFF_LONG_TYPE;
-    g_字典类型 = libbase + OFF_DICT_TYPE;
-    g_真       = libbase + OFF_TRUE;
-    snprintf(g_状态, sizeof(g_状态), "启动中");
-    std::thread(线程体).detach();
+    snprintf(g_status, sizeof(g_status), "启动中");
+    std::thread(thread_main).detach();
     printf("[自身] 已启动 libbase=0x%lx\n", (unsigned long)libbase);
     fflush(stdout);
 }
 
 // ---------------- 给绘制侧用的只读接口 ----------------
 
-static inline bool 可用() { return g_可用; }
-static inline const char *状态文本() { return g_状态; }
+static inline bool available() { return g_available; }
+static inline const char *status_text() { return g_status; }
 
 // 当前操控单位的场景对象。返回 false 时绘制侧要退回相机深度启发式
-static bool 锚点(uint64_t &obj)
+static bool anchor(uint64_t &obj)
 {
-    if (!g_可用) return false;
-    uint64_t v = g_缓冲[g_活跃].锚点;
+    if (!g_available) return false;
+    uint64_t v = g_buf[g_active].anchor;
     if (v == 0) return false;
     obj = v;
     return true;
@@ -473,44 +532,44 @@ static bool 锚点(uint64_t &obj)
 
 // 当前视角的阵营：1=监管 2=求生者。0=没读到。
 // 注意操控从属单位时这里是从属的 unit_type(机械玩偶仍是 2、梦之信徒是 236)
-static inline int 阵营() { return g_可用 ? g_缓冲[g_活跃].阵营 : 0; }
-static inline int64_t 自身uid() { return g_可用 ? g_缓冲[g_活跃].uid : 0; }
+static inline int camp() { return g_available ? g_buf[g_active].camp : 0; }
+static inline int64_t self_uid() { return g_available ? g_buf[g_active].uid : 0; }
 
 // 形态切换留下的废弃模型 —— 替掉红蝶/木偶师类名黑名单
-static bool 是废弃模型(uintptr_t obj)
+static bool is_stale_model(uintptr_t obj)
 {
-    if (!g_可用) return false;
-    const 快照 &s = g_缓冲[g_活跃];
-    for (int i = 0; i < s.废弃数; i++) if (s.废弃[i] == (uint64_t)obj) return true;
+    if (!g_available) return false;
+    const Snapshot &s = g_buf[g_active];
+    for (int i = 0; i < s.stale_count; i++) if (s.stale[i] == (uint64_t)obj) return true;
     return false;
 }
 
 // 大厅/准备阶段：Python 侧还没有任何玩家单位，场景里的 chr/player、chr/boss 对象(时装挂件、头饰、袖子)
 // 全都没有宿主，绘制侧据此整类不画。读不全时是 false，照旧按类名画
-static inline bool 局外() { return g_局外; }
+static inline bool in_lobby() { return g_in_lobby; }
 
 // 本体集合能不能用。准备阶段/大厅里 units_by_type 没有 [1]/[2](实测两次)，这里就是 false，
-// 绘制侧据此退回按类名画(读取失败时同样是 false，所以"是否局外"要看 局外()，别用它)
-static inline bool 本体集合可用() { return g_可用 && g_缓冲[g_活跃].本体数 > 0; }
+// 绘制侧据此退回按类名画(读取失败时同样是 false，所以"是否局外"要看 in_lobby()，别用它)
+static inline bool body_set_ready() { return g_available && g_buf[g_active].body_count > 0; }
 
-static bool 是本体(uintptr_t obj)
+static bool is_body(uintptr_t obj)
 {
-    if (!g_可用) return false;
-    const 快照 &s = g_缓冲[g_活跃];
-    for (int i = 0; i < s.本体数; i++) if (s.本体[i] == (uint64_t)obj) return true;
+    if (!g_available) return false;
+    const Snapshot &s = g_buf[g_active];
+    for (int i = 0; i < s.body_count; i++) if (s.body[i] == (uint64_t)obj) return true;
     return false;
 }
 
 // 局内监管本体的场景对象(跳过巡视者)。准备阶段没有 [1] 单位，返回 false
-static bool 监管本体(uint64_t &obj)
+static bool hunter_body(uint64_t &obj)
 {
-    if (!g_可用) return false;
-    uint64_t v = g_缓冲[g_活跃].监管本体;
+    if (!g_available) return false;
+    uint64_t v = g_buf[g_active].hunter_body;
     if (v == 0) return false;
     obj = v;
     return true;
 }
 
-} // namespace 本机
+} // namespace PySelf
 
 #endif // IDV_PY_SELF_H
