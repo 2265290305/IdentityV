@@ -71,6 +71,7 @@ static const NameMapping player_table[] = {
     {"w_gjs", "[弓箭手]"},
     {"w_hds", "[幻灯师]"},
     {"m_ttds", "[逃脱大师]"},
+    {"dns", "[斗牛士]"},
     {"w_moju", "[默剧艺人]"}
 
 };
