@@ -113,7 +113,36 @@ int main(int argc, char *argv[]) {
    // GetPKG();
     
     ::window = android::ANativeWindowCreator::Create("new_edition", native_window_screen_x, native_window_screen_y, permeate_record);
-    graphics->Init_Render(::window, native_window_screen_x, native_window_screen_y);
+    if (::window == nullptr) {
+        ANWC_LOGE("[startup] overlay window creation failed, abort");
+        return 1;
+    }
+
+    bool render_ready = (graphics != nullptr &&
+                         graphics->Init_Render(::window, native_window_screen_x, native_window_screen_y));
+    ANWC_LOGI("[startup] backend=%s init=%s window=%p size=%dx%d",
+              graphics ? graphics->RenderName : "none", render_ready ? "ok" : "failed",
+              ::window, native_window_screen_x, native_window_screen_y);
+
+    if (!render_ready) {
+        // Vulkan 可能在失败前已经把这块 ANativeWindow 绑过 surface，
+        // 直接复用会和 eglCreateWindowSurface 冲突（EGL_BAD_NATIVE_WINDOW），
+        // 所以丢掉失败的渲染对象和窗口，重建窗口后再上 OpenGL ES。
+        ANWC_LOGE("[startup] %s backend failed, retry with OpenGL ES", graphics ? graphics->RenderName : "Vulkan");
+        graphics.reset();
+        android::ANativeWindowCreator::Destroy(::window);
+        ::window = android::ANativeWindowCreator::Create("new_edition", native_window_screen_x, native_window_screen_y, permeate_record);
+        graphics = GraphicsManager::getGraphicsInterface(GraphicsManager::OPENGL);
+        render_ready = (::window != nullptr && graphics != nullptr &&
+                        graphics->Init_Render(::window, native_window_screen_x, native_window_screen_y));
+        ANWC_LOGI("[startup] fallback backend=%s init=%s window=%p",
+                  graphics ? graphics->RenderName : "none", render_ready ? "ok" : "failed", ::window);
+    }
+
+    if (!render_ready) {
+        ANWC_LOGE("[startup] all render backends failed, abort");
+        return 1;
+    }
     
     Touch::Init({(float)::abs_ScreenX, (float)::abs_ScreenY}, true);
     Touch::setOrientation(displayInfo.orientation);

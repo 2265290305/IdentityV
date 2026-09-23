@@ -11,6 +11,11 @@ build_last.bat
 *.obj
 *.so
 *.a
+tools/tests/build/
+
+# 本机调试/日志产物
+hack_stderr.log
+hack_stdout.log
 
 __pycache__/
 *.pyc
