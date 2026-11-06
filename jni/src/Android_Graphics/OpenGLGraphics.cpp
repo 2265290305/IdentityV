@@ -1,39 +1,9 @@
 #include <GLES3/gl3.h>
 #include <android/native_window.h>
-#include <android/log.h>
-#include <cstdio>
 #include "OpenGLGraphics.h"
 #include "imgui_impl_opengl3.h"
 #if __has_include(<EGL/eglext.h>)
 #include <EGL/eglext.h>
-#endif
-
-#define GL_LOG_TAG "IdentityV-OpenGL"
-#define GL_LOGI(...)                                                        \
-    do                                                                      \
-    {                                                                       \
-        __android_log_print(ANDROID_LOG_INFO, GL_LOG_TAG, __VA_ARGS__);      \
-        fprintf(stderr, "[GL][I] " __VA_ARGS__);                             \
-        fputc('\n', stderr);                                                 \
-    } while (0)
-#define GL_LOGE(...)                                                        \
-    do                                                                      \
-    {                                                                       \
-        __android_log_print(ANDROID_LOG_ERROR, GL_LOG_TAG, __VA_ARGS__);     \
-        fprintf(stderr, "[GL][E] " __VA_ARGS__);                             \
-        fputc('\n', stderr);                                                 \
-    } while (0)
-
-// 兼容老 NDK / 老头文件：EGL 1.5 之前没有这个宏，KHR 扩展宏也可能缺失
-#ifndef EGL_OPENGL_ES3_BIT
-#define EGL_OPENGL_ES3_BIT 0x00000040
-#endif
-#ifndef EGL_OPENGL_ES3_BIT_KHR
-#define EGL_OPENGL_ES3_BIT_KHR 0x00000040
-#endif
-// 如果需要，也可以顺手补上
-#ifndef EGL_CONTEXT_CLIENT_VERSION
-#define EGL_CONTEXT_CLIENT_VERSION 0x3098
 #endif
 
 bool OpenGLGraphics::Create() {
@@ -44,12 +14,10 @@ bool OpenGLGraphics::Create() {
 
     m_EglDisplay = eglGetDisplay(EGL_DEFAULT_DISPLAY);
     if (EGL_NO_DISPLAY == m_EglDisplay) {
-        GL_LOGE("eglGetDisplay failed: 0x%x", eglGetError());
         return false;
     }
 
     if (EGL_TRUE != eglInitialize(m_EglDisplay, nullptr, nullptr)) {
-        GL_LOGE("eglInitialize failed: 0x%x", eglGetError());
         Cleanup();
         return false;
     }
@@ -57,14 +25,12 @@ bool OpenGLGraphics::Create() {
     EGLint num_configs = 0;
     if (EGL_TRUE != eglChooseConfig(m_EglDisplay, egl_attributes, nullptr, 0, &num_configs) ||
         0 == num_configs) {
-        GL_LOGE("eglChooseConfig found no config: 0x%x", eglGetError());
         Cleanup();
         return false;
     }
 
     EGLConfig egl_config;
     if (EGL_TRUE != eglChooseConfig(m_EglDisplay, egl_attributes, &egl_config, 1, &num_configs)) {
-        GL_LOGE("eglChooseConfig failed: 0x%x", eglGetError());
         Cleanup();
         return false;
     }
@@ -77,7 +43,6 @@ bool OpenGLGraphics::Create() {
     m_EglContext = eglCreateContext(m_EglDisplay, egl_config, EGL_NO_CONTEXT,
                                     egl_context_attributes);
     if (EGL_NO_CONTEXT == m_EglContext) {
-        GL_LOGE("eglCreateContext failed: 0x%x", eglGetError());
         Cleanup();
         return false;
     }
@@ -85,20 +50,16 @@ bool OpenGLGraphics::Create() {
     m_EglSurface = eglCreateWindowSurface(m_EglDisplay, egl_config, m_Window, nullptr);
     if (EGL_NO_SURFACE == m_EglSurface) {
         // EGL_BAD_NATIVE_WINDOW(0x300B) 说明这块 ANativeWindow 已经被别的 API 绑走（比如刚失败的 Vulkan）
-        GL_LOGE("eglCreateWindowSurface failed: 0x%x", eglGetError());
         Cleanup();
         return false;
     }
 
     if (EGL_TRUE != eglMakeCurrent(m_EglDisplay, m_EglSurface, m_EglSurface, m_EglContext)) {
-        GL_LOGE("eglMakeCurrent failed: 0x%x", eglGetError());
         Cleanup();
         return false;
     }
 
     glClearColor(0.0, 0.0, 0.0, 0.0);
-    GL_LOGI("EGL ready: display=%p surface=%p context=%p, window=%dx%d", m_EglDisplay, m_EglSurface,
-            m_EglContext, ANativeWindow_getWidth(m_Window), ANativeWindow_getHeight(m_Window));
     return true;
 }
 

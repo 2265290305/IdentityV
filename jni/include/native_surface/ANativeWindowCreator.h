@@ -7,47 +7,16 @@
 #include <sys/system_properties.h>
 
 #include <cstddef>
-#include <cstdio>
-#include <climits>
-#include <cstring>   // strncmp/strstr：dynsym 特征匹配用
-#include <fcntl.h>   // 以下四个：读 libgui.so 的 .dynsym 做符号自愈
-#include <sys/stat.h>
-#include <sys/mman.h>
-#include <unistd.h>
-#include <elf.h>
 #include <unordered_map>
 #include <string>
 #include <vector>
-
-// 统一日志出口：logcat + stderr。
-// main.cpp 已把 stderr 重定向到 /data/local/tmp/hack_stderr.log，
-// 所以没有 adb 的机器也能直接取日志定位“窗口没出来”的原因。
-#define ANWC_LOG_TAG "ImGui"
-#define ANWC_LOGE(...)                                                          \
-    do                                                                          \
-    {                                                                           \
-        __android_log_print(ANDROID_LOG_ERROR, ANWC_LOG_TAG, __VA_ARGS__);      \
-        fprintf(stderr, "[ANWC][E] " __VA_ARGS__);                              \
-        fputc('\n', stderr);                                                    \
-    } while (0)
-#define ANWC_LOGI(...)                                                          \
-    do                                                                          \
-    {                                                                           \
-        __android_log_print(ANDROID_LOG_INFO, ANWC_LOG_TAG, __VA_ARGS__);       \
-        fprintf(stderr, "[ANWC][I] " __VA_ARGS__);                              \
-        fputc('\n', stderr);                                                    \
-    } while (0)
 
 #define ResolveMethod(ClassName, MethodName, Handle, MethodSignature)                                                                    \
     ClassName##__##MethodName = reinterpret_cast<decltype(ClassName##__##MethodName)>(symbolMethod.Find(Handle, MethodSignature));       \
     if (nullptr == ClassName##__##MethodName)                                                                                            \
     {                                                                                                                                    \
-        ANWC_LOGE("[-] Method not found: %s -> %s::%s", MethodSignature, #ClassName, #MethodName);                                       \
+        __android_log_print(ANDROID_LOG_ERROR, "ImGui", "[-] Method not found: %s -> %s::%s", MethodSignature, #ClassName, #MethodName); \
     }
-
-// 可选符号：解析不到是正常的（例如老签名只存在于旧系统），不打错误日志。
-#define ResolveOptionalMethod(ClassName, MethodName, Handle, MethodSignature)                                                             \
-    ClassName##__##MethodName = reinterpret_cast<decltype(ClassName##__##MethodName)>(symbolMethod.Find(Handle, MethodSignature));
 
 namespace android
 {
@@ -240,9 +209,7 @@ namespace android
             }
 
             if (nullptr != slot)
-                ANWC_LOGI("[+] %s resolved via dynsym: %s", what, candidates[0].c_str());
             else
-                ANWC_LOGE("[-] %s: no ABI-compatible symbol found in %s", what, libPath);
         }
     } // namespace detail
 
@@ -395,11 +362,9 @@ namespace android
 
                 if (9 > systemVersion)
                 {
-                    ANWC_LOGE("[-] Unsupported system version: %zu", systemVersion);
                     return;
                 }
 
-                ANWC_LOGI("[*] Android %zu, resolving libgui/libutils symbols", systemVersion);
 
                 static std::unordered_map<size_t, std::unordered_map<void **, const char *>> patchesTable = {
                     {
@@ -513,7 +478,6 @@ namespace android
                 if (patchesTable.end() != it)
                 {
                     if (it->first != systemVersion)
-                        ANWC_LOGI("[*] Android %zu has no dedicated patch set, reuse Android %zu", systemVersion, it->first);
 
                     for (const auto &[patchTo, signature] : it->second)
                     {
@@ -521,22 +485,13 @@ namespace android
                         if (nullptr != *patchTo)
                             continue;
 
-                        ANWC_LOGE("[-] Patch method not found: %s", signature);
                     }
                 }
                 else
                 {
-                    ANWC_LOGI("[*] Android %zu, no patch set matched, use default symbols", systemVersion);
                 }
 
                 // 关键槽位一次性打出来：某个为 0 就能直接判断是“符号没解析到”还是“渲染失败”。
-                ANWC_LOGI("[*] key symbols: LayerMetadataCtor=%p CreateSurface=%p GetSurface=%p TrustedOverlay=%p Apply=%p DisplayIds=%p",
-                          reinterpret_cast<void *>(LayerMetadata__Constructor),
-                          reinterpret_cast<void *>(SurfaceComposerClient__CreateSurface),
-                          reinterpret_cast<void *>(SurfaceControl__GetSurface),
-                          reinterpret_cast<void *>(SurfaceComposerClient__Transaction__SetTrustedOverlay),
-                          reinterpret_cast<void *>(SurfaceComposerClient__Transaction__Apply),
-                          reinterpret_cast<void *>(SurfaceComposerClient__GetPhysicalDisplayIds));
 
                 // dynsym 自愈：patch 表都失效/空时，按 ABI 等价特征扫一遍 .dynsym。
                 // 必须在此之前先 Close libutils，否则 Close libgui 会失败（关联的懒打开库尚未加载）。
@@ -547,7 +502,6 @@ namespace android
                     {
                         // 构造个命令的 std::string 避免参数求值顺序 UB
                         std::string libPath(path);
-                        ANWC_LOGI("[*] trying dynsym fallback from %s", path);
                         ResolveByDynSymPattern<decltype(LayerMetadata__Constructor)>(LayerMetadata__Constructor, symbolMethod, libgui, libPath.c_str(), "_ZN7android", &AcceptLayerMetadataCtor, "LayerMetadata::Constructor");
                         ResolveByDynSymPattern<decltype(LayerMetadata__setInt32)>(LayerMetadata__setInt32, symbolMethod, libgui, libPath.c_str(), "_ZN7android", &AcceptLayerMetadataSetInt32, "LayerMetadata::setInt32");
                         ResolveByDynSymPattern<decltype(SurfaceComposerClient__CreateSurface)>(SurfaceComposerClient__CreateSurface, symbolMethod, libgui, libPath.c_str(), "_ZN7android21SurfaceComposerClient13createSurfaceE", &AcceptCreateSurfaceVariant, "SurfaceComposerClient::CreateSurface");
@@ -578,7 +532,6 @@ namespace android
                 auto constructor = Functionals::GetInstance().String8__Constructor;
                 if (nullptr == constructor)
                 {
-                    ANWC_LOGE("[-] String8 construction failed: symbol not resolved (libutils)");
                     return;
                 }
 
@@ -615,7 +568,6 @@ namespace android
                 if (nullptr == constructor)
                 {
                     // 不判空就会跳到 0 造成启动即 SIGSEGV（Android 17 上的原始故障）
-                    ANWC_LOGE("[-] LayerMetadata construction failed: symbol not resolved (libgui)");
                     return;
                 }
 
@@ -628,7 +580,6 @@ namespace android
                 auto setInt32 = Functionals::GetInstance().LayerMetadata__setInt32;
                 if (nullptr == setInt32 || !valid)
                 {
-                    ANWC_LOGE("[-] LayerMetadata::setInt32 skipped: symbol not resolved or metadata invalid");
                     return;
                 }
 
@@ -718,7 +669,6 @@ namespace android
                 auto validate = Functionals::GetInstance().SurfaceControl__Validate;
                 if (nullptr == validate)
                 {
-                    ANWC_LOGE("[-] SurfaceControl::validate: symbol not resolved");
                     return 0;
                 }
 
@@ -733,14 +683,12 @@ namespace android
                 auto getSurface = Functionals::GetInstance().SurfaceControl__GetSurface;
                 if (nullptr == getSurface)
                 {
-                    ANWC_LOGE("[-] SurfaceControl::getSurface: symbol not resolved");
                     return nullptr;
                 }
 
                 auto result = getSurface(data);
                 if (nullptr == result.pointer)
                 {
-                    ANWC_LOGE("[-] SurfaceControl::getSurface returned null");
                     return nullptr;
                 }
 
@@ -757,7 +705,6 @@ namespace android
                 auto disconnect = Functionals::GetInstance().SurfaceControl__DisConnect;
                 if (nullptr == disconnect)
                 {
-                    ANWC_LOGE("[-] SurfaceControl::disconnect: symbol not resolved");
                     return;
                 }
 
@@ -790,7 +737,6 @@ namespace android
                 auto constructor = Functionals::GetInstance().SurfaceComposerClient__Transaction__Constructor;
                 if (nullptr == constructor)
                 {
-                    ANWC_LOGE("[-] Transaction construction failed: symbol not resolved (libgui)");
                     return;
                 }
 
@@ -803,7 +749,6 @@ namespace android
                 auto setLayer = Functionals::GetInstance().SurfaceComposerClient__Transaction__SetLayer;
                 if (nullptr == setLayer || !valid)
                 {
-                    ANWC_LOGE("[-] Transaction::setLayer skipped: symbol not resolved or transaction invalid");
                     return nullptr;
                 }
 
@@ -834,7 +779,6 @@ namespace android
                 auto setTrustedOverlay = Functionals::GetInstance().SurfaceComposerClient__Transaction__SetTrustedOverlay;
                 if (nullptr == setTrustedOverlay || !valid)
                 {
-                    ANWC_LOGE("[-] Transaction::setTrustedOverlay skipped: symbol not resolved or transaction invalid");
                     return nullptr;
                 }
 
@@ -864,13 +808,11 @@ namespace android
                     if (nullptr != functionals.SurfaceComposerClient__Transaction__Apply)
                         return reinterpret_cast<int32_t (*)(void *, bool)>(functionals.SurfaceComposerClient__Transaction__Apply)(data, synchronous);
 
-                    ANWC_LOGE("[-] Transaction::apply: symbol not resolved");
                     return -1;
                 }
 
                 if (nullptr == functionals.SurfaceComposerClient__Transaction__Apply)
                 {
-                    ANWC_LOGE("[-] Transaction::apply(bool, bool): symbol not resolved");
                     return -1;
                 }
 
@@ -888,14 +830,12 @@ namespace android
                 auto constructor = Functionals::GetInstance().SurfaceComposerClient__Constructor;
                 if (nullptr == constructor)
                 {
-                    ANWC_LOGE("[-] SurfaceComposerClient construction failed: symbol not resolved (libgui)");
                     return;
                 }
 
                 auto incStrong = Functionals::GetInstance().RefBase__IncStrong;
                 if (nullptr == incStrong)
                 {
-                    ANWC_LOGE("[-] RefBase::incStrong: symbol not resolved (libutils)");
                     return;
                 }
 
@@ -951,13 +891,11 @@ namespace android
 
                 if (!valid)
                 {
-                    ANWC_LOGE("[-] CreateSurface(%s) failed: SurfaceComposerClient invalid", name);
                     return {};
                 }
 
                 if (!windowName.valid)
                 {
-                    ANWC_LOGE("[-] CreateSurface(%s) failed: String8 invalid", name);
                     return {};
                 }
 
@@ -974,7 +912,6 @@ namespace android
 
                     if (nullptr == Functionals::GetInstance().SurfaceComposerClient__CreateSurface_and9)
                     {
-                        ANWC_LOGE("[-] CreateSurface(%s) failed: createSurface(Android 9) symbol not resolved", name);
                         return {};
                     }
 
@@ -984,7 +921,6 @@ namespace android
                 {
                     if (nullptr == Functionals::GetInstance().SurfaceComposerClient__CreateSurface)
                     {
-                        ANWC_LOGE("[-] CreateSurface(%s) failed: createSurface symbol not resolved (Android %zu)", name, version);
                         return {};
                     }
 
@@ -992,13 +928,11 @@ namespace android
                 }
                 else
                 {
-                    ANWC_LOGE("[-] CreateSurface(%s) failed: unsupported Android %zu", name, version);
                     return {};
                 }
 
                 if (nullptr == result.get())
                 {
-                    ANWC_LOGE("[-] CreateSurface(%s) failed: createSurface returned null (Android %zu, %dx%d)", name, version, width, height);
                     return {};
                 }
 
@@ -1013,8 +947,6 @@ namespace android
                     transaction.Apply(false, true);
                 }
 
-                ANWC_LOGI("[+] CreateSurface(%s) ok: surfaceControl=%p (%dx%d, Android %zu, skipScrenshot=%d)",
-                          name, result.get(), width, height, version, skipScrenshot ? 1 : 0);
                 return {result.get()};
             }
 
@@ -1025,7 +957,6 @@ namespace android
 
                 if (!valid)
                 {
-                    ANWC_LOGE("[-] GetDisplayInfo failed: SurfaceComposerClient invalid");
                     return false;
                 }
 
@@ -1033,7 +964,6 @@ namespace android
                 {
                     if (nullptr == functionals.SurfaceComposerClient__GetBuiltInDisplay)
                     {
-                        ANWC_LOGE("[-] GetDisplayInfo failed: getBuiltInDisplay symbol not resolved");
                         return false;
                     }
 
@@ -1045,7 +975,6 @@ namespace android
                     {
                         if (nullptr == functionals.SurfaceComposerClient__GetInternalDisplayToken)
                         {
-                            ANWC_LOGE("[-] GetDisplayInfo failed: getInternalDisplayToken symbol not resolved");
                             return false;
                         }
 
@@ -1056,14 +985,12 @@ namespace android
                         if (nullptr == functionals.SurfaceComposerClient__GetPhysicalDisplayIds ||
                             nullptr == functionals.SurfaceComposerClient__GetPhysicalDisplayToken)
                         {
-                            ANWC_LOGE("[-] GetDisplayInfo failed: getPhysicalDisplayIds/Token symbol not resolved");
                             return false;
                         }
 
                         auto displayIds = functionals.SurfaceComposerClient__GetPhysicalDisplayIds();
                         if (displayIds.empty())
                         {
-                            ANWC_LOGE("[-] GetDisplayInfo failed: no physical display id");
                             return false;
                         }
 
@@ -1073,7 +1000,6 @@ namespace android
 
                 if (nullptr == defaultDisplay.get())
                 {
-                    ANWC_LOGE("[-] GetDisplayInfo failed: display token is null");
                     return false;
                 }
 
@@ -1081,7 +1007,6 @@ namespace android
                 {
                     if (nullptr == functionals.SurfaceComposerClient__GetDisplayState)
                     {
-                        ANWC_LOGE("[-] GetDisplayInfo failed: getDisplayState symbol not resolved");
                         return false;
                     }
 
@@ -1091,7 +1016,6 @@ namespace android
                 {
                     if (nullptr == functionals.SurfaceComposerClient__GetDisplayInfo)
                     {
-                        ANWC_LOGE("[-] GetDisplayInfo failed: getDisplayInfo symbol not resolved");
                         return false;
                     }
 
@@ -1171,18 +1095,15 @@ namespace android
                 break;
             }
 
-            ANWC_LOGI("[*] Create(%s): request %dx%d (skipScrenshot=%d)", name, width, height, skipScrenshot_ ? 1 : 0);
 
             auto surfaceControl = surfaceComposerClient.CreateSurface(name, width, height, skipScrenshot_);
             auto nativeWindow = reinterpret_cast<ANativeWindow *>(surfaceControl.GetSurface());
             if (nullptr == nativeWindow)
             {
-                ANWC_LOGE("[-] Create(%s) failed: ANativeWindow is null", name);
                 return nullptr;
             }
 
             m_cachedSurfaceControl.emplace(nativeWindow, std::move(surfaceControl));
-            ANWC_LOGI("[+] Create(%s) ok: ANativeWindow=%p", name, nativeWindow);
             return nativeWindow;
         }
 
@@ -1207,6 +1128,5 @@ namespace android
 }
 
 #undef ResolveMethod
-#undef ResolveOptionalMethod
 
 #endif // !A_NATIVE_WINDOW_CREATOR_H
